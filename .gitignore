@@ -1,0 +1,30 @@
+# Python cache and build outputs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local logs and crash dumps
+*.log
+*.out
+*.err
+*.mudmp
+core.*
+
+# Large local model files
+clj-proj/model/
+*.safetensors
+*.pth
+
+# Generated experiment outputs
+artifacts/
+latest_artifact.txt
+
+# Local copied/misplaced paths
+home/
