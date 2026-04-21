@@ -25,6 +25,16 @@ clj-proj/model/
 # Generated experiment outputs
 artifacts/
 latest_artifact.txt
+latest_*_artifact.txt
 
 # Local copied/misplaced paths
 home/
+
+# Local tooling / auth state
+.codex
+.codex/
+.env
+.env.*
+
+# Local package caches / installers
+*.deb

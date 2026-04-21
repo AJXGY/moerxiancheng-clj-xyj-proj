@@ -10,6 +10,7 @@
 - `gloo` 通信后端
 - `musa:0 / musa:1` 双卡设备缓冲区
 - CPU staging 完成 `Send/Recv` 与 `AllReduce` 微基准
+- 主分析工具独立算子预测入口负责输出 `T_sim`
 
 这条路径满足任务 A-F 对环境配置、实际通信算子执行、建模预测、误差计算和准确性验证的要求。
 
@@ -37,7 +38,7 @@ bash run_529_suite.sh
 
 - `operator_specs.json`：通信算子与消息规模描述
 - `benchmark_comm_ops.py`：双进程通信微基准
-- `fit_space_model.py`：空间维度模型拟合与误差计算
+- `fit_space_model.py`：调用主分析工具的算子级预测入口并计算误差
 - `generate_charts.py`：生成 600 dpi PNG 图表
 - `summarize_results.py`：输出 `5.2.9任务进展.md`
 - `probe_mccl.py`：保留 `mccl` 运行时排查脚本

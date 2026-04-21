@@ -1,14 +1,44 @@
 import math
 
+
+DEFAULT_CALIBRATION = {
+    "mm": {"scale": 1.0},
+    "sdpa": {"flash_scale": 1.0, "non_flash_scale": 1.2},
+    "rmsnorm": {
+        "latency_floor_us": 82.0,
+        "streaming_coeff_us_per_elem": 1.2e-4,
+        "small_shape_penalty_us": 140.0,
+        "small_shape_threshold": 512,
+        "scale": 1.0,
+    },
+    "softmax": {
+        "memory_efficiency": 0.55,
+        "reduction_coeff_us_per_elem": 1.8e-5,
+        "scale": 1.0,
+    },
+    "add": {"bandwidth_scale": 1.15, "scale": 1.0},
+    "ffn": {"scale": 1.0},
+}
+
+
 class PredictorEngine:
     """算子时间预测主引擎：解耦硬件 specs 和算子逻辑"""
     def __init__(self, hw_profile):
         self.peak_tflops = hw_profile.peak_tflops
         self.peak_bw_gbps = hw_profile.peak_bw_gbps
         self.overhead_us = hw_profile.kernel_overhead_us
-        self.num_sms = 108  # A100 标准，若是其他卡可从 hw_profile 扩展获取
+        self.num_sms = max(1, int(getattr(hw_profile, "num_sms", 108) or 108))
+        self.device_name = getattr(hw_profile, "device_name", "unknown")
+        self.device_capability = getattr(hw_profile, "device_capability", None)
+        self.supports_flash_attention = getattr(hw_profile, "supports_flash_attention", True)
+        self.gemm_overhead_us = self.overhead_us
+        self.reduction_overhead_us = min(self.overhead_us * 0.18, 24.0)
+        self.elementwise_overhead_us = min(self.overhead_us * 0.12, 16.0)
+        self.norm_overhead_us = min(self.overhead_us * 0.04, 8.0)
         self.kernels = {}
-        self.hw=hw_profile
+        self.hw = hw_profile
+        self.calibration = self._build_calibration(getattr(hw_profile, "calibration", {}))
+
     def register_kernel(self, name, kernel_class):
         self.kernels[name] = kernel_class(self)
 
@@ -16,6 +46,40 @@ class PredictorEngine:
         if name not in self.kernels:
             raise ValueError(f"算子 '{name}' 未注册！")
         return self.kernels[name].predict_us(*args, **kwargs)
+
+    def _build_calibration(self, overrides):
+        calibration = {}
+        overrides = overrides or {}
+        for kernel_name, defaults in DEFAULT_CALIBRATION.items():
+            merged = dict(defaults)
+            merged.update(overrides.get(kernel_name, {}))
+            calibration[kernel_name] = merged
+        return calibration
+
+    def get_kernel_params(self, name):
+        return self.calibration.setdefault(name, dict(DEFAULT_CALIBRATION.get(name, {})))
+
+    def update_kernel_from_measurements(self, name, predicted_values, actual_values):
+        valid_pairs = [
+            (pred, actual)
+            for pred, actual in zip(predicted_values, actual_values)
+            if pred > 0 and actual > 0
+        ]
+        if not valid_pairs:
+            return
+        ratios = sorted(actual / pred for pred, actual in valid_pairs)
+        median_ratio = ratios[len(ratios) // 2]
+        adjustment = 1.0 + (median_ratio - 1.0) * 0.5
+        params = self.get_kernel_params(name)
+
+        if name == "sdpa":
+            key = "flash_scale" if self.supports_flash_attention else "non_flash_scale"
+            params[key] = max(0.5, min(2.0, params.get(key, 1.0) * adjustment))
+        else:
+            params["scale"] = max(0.5, min(2.0, params.get("scale", 1.0) * adjustment))
+
+    def export_calibration(self):
+        return self.calibration
 
 class BaseKernel:
     def __init__(self, engine:PredictorEngine):
@@ -26,6 +90,7 @@ class BaseKernel:
 class GEMMKernel(BaseKernel):
     """矩阵乘法 (MM/Linear) 预测逻辑"""
     def predict_us(self, M, K, N):
+        params = self.engine.get_kernel_params("mm")
         tile_m, tile_n = 128, 128
         
         # 1. 访存预测 (Memory Bound)
@@ -40,7 +105,8 @@ class GEMMKernel(BaseKernel):
         flops_per_block = 2.0 * tile_m * tile_n * K
         t_wave_us = (flops_per_block / (self.engine.peak_tflops / self.engine.num_sms * 1e12)) * 1e6
         
-        return max(waves * t_wave_us, t_mem_us) + self.engine.overhead_us
+        raw_us = max(waves * t_wave_us, t_mem_us) + self.engine.gemm_overhead_us
+        return raw_us * params.get("scale", 1.0)
 
 class SDPAKernel(BaseKernel):
     """
@@ -48,42 +114,52 @@ class SDPAKernel(BaseKernel):
     考虑到 S 维度的并行切分
     """
     def predict_us(self, B, H, S, D):
-        bytes_acc = 4 * (B * H * S * D) * 2.0
-        t_mem_us = (bytes_acc / (self.engine.peak_bw_gbps * 0.9 * 1e9)) * 1e6
-        
-
+        params = self.engine.get_kernel_params("sdpa")
+        bytes_per_elem = 2.0
         tile_s = 128 
         num_s_blocks = math.ceil(S / tile_s)
-        
-        # 总任务数 = Batch * Heads * S_blocks
         total_tasks = B * H * num_s_blocks
         waves = math.ceil(total_tasks / self.engine.num_sms)
-        
-        # 总 FLOPs = 4 * B * H * S^2 * D
-        # 分摊到每个 task
-        flops_per_task = (4.0 * B * H * (S**2) * D) / total_tasks 
-        
-        # 每一个 SM 的理论产出
+
         tflops_per_sm = self.engine.peak_tflops / self.engine.num_sms 
-        
+
+        if self.engine.supports_flash_attention:
+            bytes_acc = 4 * (B * H * S * D) * bytes_per_elem
+            total_flops = 4.0 * B * H * (S**2) * D
+            flops_per_task = total_flops / total_tasks
+            t_task_us = (flops_per_task / (tflops_per_sm * 1e12)) * 1e6
+            t_comp_us = waves * t_task_us / 0.8
+            t_mem_us = (bytes_acc / (self.engine.peak_bw_gbps * 0.9 * 1e9)) * 1e6
+            raw_us = max(t_comp_us, t_mem_us) + self.engine.reduction_overhead_us
+            return raw_us * params.get("flash_scale", 1.0)
+
+        # MP 2.1 这类设备不会走 FlashAttention，这里改用更贴近普通 SDPA 路径的经验模型。
+        bytes_acc = (
+            3 * B * H * S * D
+            + 2 * B * H * S * S
+            + B * H * S * D
+        ) * bytes_per_elem
+        total_flops = 4.0 * B * H * (S**2) * D
+        flops_per_task = total_flops / total_tasks
         t_task_us = (flops_per_task / (tflops_per_sm * 1e12)) * 1e6
-        t_comp_us = waves * t_task_us  / 0.8  # 考虑 Tensor Core 的效率损失
-        
-        # 3. 结果合并
-        # 注意：SDPA 随着 S 增加，计算量按 S^2 增长，而访存按 S 增长，所以 S 大了必然是 Compute Bound
-        return max(t_comp_us, t_mem_us) + self.engine.overhead_us
+        t_comp_us = waves * t_task_us * 0.22
+        t_mem_us = (bytes_acc / (self.engine.peak_bw_gbps * 0.45 * 1e9)) * 1e6
+        raw_us = max(t_comp_us, t_mem_us) * params.get("non_flash_scale", 1.2)
+        return raw_us + self.engine.reduction_overhead_us
 
 
 
 class FFNKernel(BaseKernel):
     def predict_us(self, B, M, N):
+        params = self.engine.get_kernel_params("ffn")
         bytes_acc = (B * M + B * N + M * N) * 2.0
         t_mem_us = (bytes_acc / (self.engine.peak_bw_gbps * 0.9 * 1e9)) * 1e6
         
         flops = 2.0 * B * M * N
         t_comp_us = (flops / (self.engine.peak_tflops * 1e12)) * 1e6
         
-        return max(t_comp_us, t_mem_us) + self.engine.overhead_us
+        raw_us = max(t_comp_us, t_mem_us) + self.engine.gemm_overhead_us
+        return raw_us * params.get("scale", 1.0)
 
 
 
@@ -91,35 +167,34 @@ class FFNKernel(BaseKernel):
 class RMSNormKernel(BaseKernel):
     def __init__(self, engine):
         super().__init__(engine)
-        # 校准值：算子在 GPU 上的物理拉起延迟 (可以通过 M=1 时的实测值扣除 overhead 得到)
-        # 在 A100 上，复杂的 Norm 算子通常有 30-40us 的固定成本
-        self.latency_floor_us = 35.0 
 
     def predict_us(self, B, S, H):
-        # 1. 理论计算量
+        params = self.engine.get_kernel_params("rmsnorm")
         num_elements = B * S * H
-        bytes_acc = num_elements * 2 * 2 # BF16, 1读1写
-        
-        # 2. 显存带宽耗时 (HBM)
-        t_hbm_us = (bytes_acc / (self.engine.peak_bw_gbps * 0.9 * 1e9)) * 1e6
-        
-        t_core_us = self.latency_floor_us + t_hbm_us
-        
-        return t_core_us + self.engine.overhead_us
+        streaming_us = num_elements * params.get("streaming_coeff_us_per_elem", 1.2e-4)
+        threshold = params.get("small_shape_threshold", 512)
+        small_shape_penalty_us = params.get("small_shape_penalty_us", 140.0) if S <= threshold else 0.0
+        raw_us = (
+            params.get("latency_floor_us", 82.0)
+            + streaming_us
+            + small_shape_penalty_us
+            + self.engine.norm_overhead_us
+        )
+        return raw_us * params.get("scale", 1.0)
 
 class SoftmaxKernel(BaseKernel):
     def predict_us(self, B, S, H):
-        # Bytes: 读输入 X, 写输出 Y 
+        params = self.engine.get_kernel_params("softmax")
+        num_elements = B * S * H
         bytes_acc = (B * S * H * 2.0) * 2.0 
-        
-        # FLOPs: 平方、求和、除法、乘法，平均每个元素约 4 个 FLOPs
-        flops = 4.0 * B * S * H 
-        
-        # 朴素 Roofline 公式
+        flops = 4.0 * num_elements
         t_compute_us = (flops / (self.engine.peak_tflops * 1e12)) * 1e6
-        t_memory_us = (bytes_acc / (self.engine.peak_bw_gbps * 1e9)) * 1e6
-        
-        return max(t_compute_us, t_memory_us) + self.engine.overhead_us
+        memory_efficiency = params.get("memory_efficiency", 0.55)
+        reduction_coeff = params.get("reduction_coeff_us_per_elem", 1.8e-5)
+        t_memory_us = (bytes_acc / (self.engine.peak_bw_gbps * memory_efficiency * 1e9)) * 1e6
+        t_reduce_us = num_elements * reduction_coeff
+        raw_us = max(t_compute_us, t_memory_us, t_reduce_us) + self.engine.elementwise_overhead_us
+        return raw_us * params.get("scale", 1.0)
 
 
 class ADDKernel(BaseKernel):
@@ -132,6 +207,7 @@ class ADDKernel(BaseKernel):
 
 
     def predict_us(self, *shape):
+        params = self.engine.get_kernel_params("add")
         """
         shape: 传入张量的维度，比如 (B, S, H)
         """
@@ -143,7 +219,7 @@ class ADDKernel(BaseKernel):
         flops = num_elements * 1.0
 
         bytes_acc = num_elements * 3.0 * 2.0  # BF16占2字节
-        eff_bw_gbps = self.engine.peak_bw_gbps 
+        eff_bw_gbps = self.engine.peak_bw_gbps * params.get("bandwidth_scale", 1.15)
         
         # 3. 耗时计算
         t_memory_us = (bytes_acc / (eff_bw_gbps * 1e9)) * 1e6
@@ -152,7 +228,8 @@ class ADDKernel(BaseKernel):
         # 访存主导
         t_core_us = max(t_compute_us, t_memory_us)
         
-        return t_core_us + self.engine.overhead_us
+        raw_us = t_core_us + min(self.engine.elementwise_overhead_us * 2.0, 28.0)
+        return raw_us * params.get("scale", 1.0)
 
 class AllReduceKernel(BaseKernel):
     """

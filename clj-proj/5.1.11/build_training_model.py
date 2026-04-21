@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import json
-import math
 import os
 from datetime import datetime, timezone
 
@@ -23,6 +22,8 @@ def dump_json(path, payload):
 def build_model():
     task = load_json(os.path.join(ROOT, "training_task_config.json"))
     mapping = load_json(os.path.join(ROOT, "resource_mapping.json"))
+    tensor_parallel_size = int(task["parallelism"]["tensor_parallel_size"])
+    tensor_parallel_enabled = tensor_parallel_size > 1
 
     micro_batches = task["global_batch_size"] // (
         task["micro_batch_size"] * task["parallelism"]["data_parallel_size"]
@@ -94,7 +95,8 @@ def build_model():
         "parallel_strategy": {
             "data_parallel_size": task["parallelism"]["data_parallel_size"],
             "pipeline_parallel_size": task["parallelism"]["pipeline_parallel_size"],
-            "tensor_parallel_size": task["parallelism"]["tensor_parallel_size"],
+            "tensor_parallel_size": tensor_parallel_size,
+            "tensor_parallel_enabled": tensor_parallel_enabled,
             "zero_stage": task["zero_stage"],
             "activation_checkpointing": task["activation_checkpointing"]
         },
@@ -121,7 +123,8 @@ def build_model():
             "parallel_strategy_present": True,
             "microbatch_logic_present": True,
             "dag_present": True,
-            "consistency_check": "pass"
+            "consistency_check": "pass",
+            "runtime_execution_verified": False
         }
     }
     return execution_model

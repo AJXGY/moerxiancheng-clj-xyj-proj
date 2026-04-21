@@ -19,6 +19,15 @@ def write(path, content):
         f.write(content)
 
 
+def tensor_parallel_label(model):
+    strategy = model["parallel_strategy"]
+    size = int(strategy.get("tensor_parallel_size", 1))
+    enabled = bool(strategy.get("tensor_parallel_enabled", size > 1))
+    if enabled:
+        return f"张量并行: {size}"
+    return f"张量并行: 未启用（size={size}）"
+
+
 def wrap(title, height, body):
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="900" height="{height}" viewBox="0 0 900 {height}">
 <rect width="100%" height="100%" fill="#f8fafc"/>
@@ -75,7 +84,9 @@ def pipeline_chart(model):
     body.append('<text x="560" y="118" font-size="18" font-family="Arial, Helvetica, sans-serif" fill="#0f172a" font-weight="700">并行策略</text>')
     body.append('<text x="560" y="150" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">数据并行: 2</text>')
     body.append('<text x="560" y="175" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">流水线并行: 2</text>')
-    body.append('<text x="560" y="200" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">张量并行: 1</text>')
+    body.append(
+        f'<text x="560" y="200" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">{tensor_parallel_label(model)}</text>'
+    )
     body.append('<text x="560" y="225" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">ZeRO Stage: 1</text>')
     return wrap("多卡划分与并行方式", 340, "\n".join(body))
 

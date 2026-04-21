@@ -111,7 +111,7 @@ def build_markdown(output_path, preflight, single, dual):
         for worker in payload.get("worker_payloads", []):
             for item in worker.get("results", []):
                 sample_lines.append(
-                    f"| {label} | {item['id']} | {item['response'].replace(chr(10), '<br>')} | {'通过' if item.get('validation_passed') else '未通过'} |"
+                    f"| {label} | {item['id']} | {item['response'].replace(chr(10), '<br>')} | {item.get('raw_response', '').replace(chr(10), '<br>')} | {'通过' if item.get('validation_passed') else '未通过'} |"
                 )
     lines = ["# 5.1.5任务进展", "", f"- 生成时间：{generated_at}", f"- 任务标识：MTT-INFER-RUN-TEST", "- 任务名称：摩尔线程架构上推理任务运行测试", "", "## 当前结论", ""]
 
@@ -147,12 +147,12 @@ def build_markdown(output_path, preflight, single, dual):
             f"- 双卡输出校验：{'通过' if dual and dual.get('validation_passed') else '未通过'}",
             f"- 单卡命中条数：{single.get('validated_outputs_count', 0) if single else 0}/{single.get('outputs_count', 0) if single else 0}",
             f"- 双卡命中条数：{dual.get('validated_outputs_count', 0) if dual else 0}/{dual.get('outputs_count', 0) if dual else 0}",
-            "- 校验规则：以响应首个非空行为最终答案进行严格匹配；部分响应在首行之后仍带有冗余续写，已在摘录中保留。",
+            "- 校验规则：保留原始响应，同时对响应做标准化答案提取；仅当提取出的最终答案与标准答案完全一致时判定为通过。",
             "",
             "## 输出结果摘录",
             "",
-            "| 规模 | Prompt ID | 响应 | 校验 |",
-            "| --- | --- | --- | --- |",
+            "| 规模 | Prompt ID | 标准化答案 | 原始响应 | 校验 |",
+            "| --- | --- | --- | --- | --- |",
             *sample_lines,
             "",
             "## 如何复线",

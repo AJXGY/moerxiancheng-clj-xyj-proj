@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-15T10:48:25.162859+00:00",
+  "generated_at": "2026-04-19T17:41:36.253557+00:00",
   "task_id": "MTT-TRAIN-MODEL-STRUCT-TEST",
   "task_name": "llama3.1_8b_lora_training",
   "model_name": "Meta-Llama-3.1-8B",
@@ -89,6 +89,7 @@
     "data_parallel_size": 2,
     "pipeline_parallel_size": 2,
     "tensor_parallel_size": 1,
+    "tensor_parallel_enabled": false,
     "zero_stage": 1,
     "activation_checkpointing": true
   },
@@ -209,6 +210,7 @@
     "parallel_strategy_present": true,
     "microbatch_logic_present": true,
     "dag_present": true,
-    "consistency_check": "pass"
+    "consistency_check": "pass",
+    "runtime_execution_verified": false
   }
 }

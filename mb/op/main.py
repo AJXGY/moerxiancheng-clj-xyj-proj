@@ -1,115 +1,174 @@
 import argparse
-import torch
+from dataclasses import dataclass
+
 from hardware_profiler import HardwareProfiler
-from bench_core import MatmulBenchmark, SDPABenchmark, RMSNormBenchmark, SoftmaxBenchmark, FFNBenchmark, ADDBenchmark
-from predictor import PredictorEngine, GEMMKernel, SDPAKernel, RMSNormKernel, SoftmaxKernel, FFNKernel, ADDKernel
+from bench_core import (
+    ADDBenchmark,
+    FFNBenchmark,
+    MatmulBenchmark,
+    RMSNormBenchmark,
+    SDPABenchmark,
+    SoftmaxBenchmark,
+)
+from predictor import (
+    ADDKernel,
+    FFNKernel,
+    GEMMKernel,
+    PredictorEngine,
+    RMSNormKernel,
+    SDPAKernel,
+    SoftmaxKernel,
+)
 
-# ==========================================
-# 测试任务封装区 (将每种算子的测试独立拆分)
-# ==========================================
 
-def test_matmul(engine):
-    K, N = 4096, 14336
-    print(f"\n 校验 GEMM (矩阵乘法) | M, K, N 参数扫描")
-    print(f"{'M':<8} | {'预测(us)':<12} | {'实测(us)':<12} | {'误差 %':<8}")
+@dataclass(frozen=True)
+class OperatorSpec:
+    key: str
+    title: str
+    sweep_label: str
+    sweep_values: list
+    predictor_key: str
+    build_predict_kwargs: callable
+    build_benchmark: callable
+
+
+OPERATOR_SPECS = {
+    "mm": OperatorSpec(
+        key="mm",
+        title="校验 GEMM (矩阵乘法) | ( M, 4096, 14336 ) 扫描",
+        sweep_label="M",
+        sweep_values=[512, 2048, 8192, 16384],
+        predictor_key="mm",
+        build_predict_kwargs=lambda value: {"M": value, "K": 4096, "N": 14336},
+        build_benchmark=lambda value: MatmulBenchmark(M=value, K=4096, N=14336),
+    ),
+    "sdpa": OperatorSpec(
+        key="sdpa",
+        title="校验 FlashAttention (SDPA) | (4, 32, N) 扫描",
+        sweep_label="N",
+        sweep_values=[512, 1024, 2048, 4096],
+        predictor_key="sdpa",
+        build_predict_kwargs=lambda value: {"B": 4, "H": 32, "S": value, "D": 128},
+        build_benchmark=lambda value: SDPABenchmark(
+            batch_size=4, num_heads=32, seq_len=value, head_dim=128
+        ),
+    ),
+    "rmsnorm": OperatorSpec(
+        key="rmsnorm",
+        title="校验 RMSNorm | (4, N, 128) 扫描",
+        sweep_label="N",
+        sweep_values=[512, 1024, 2048, 4096],
+        predictor_key="rmsnorm",
+        build_predict_kwargs=lambda value: {"B": 4, "S": value, "H": 128},
+        build_benchmark=lambda value: RMSNormBenchmark(
+            batch_size=4, seq_len=value, hidden_size=128
+        ),
+    ),
+    "softmax": OperatorSpec(
+        key="softmax",
+        title="校验 Softmax | (4, 32, N) 扫描",
+        sweep_label="N",
+        sweep_values=[512, 1024, 2048, 4096, 8192],
+        predictor_key="softmax",
+        build_predict_kwargs=lambda value: {"B": 4, "S": 32, "H": value},
+        build_benchmark=lambda value: SoftmaxBenchmark(
+            batch_size=4, num_heads=32, seq_len=value
+        ),
+    ),
+    "add": OperatorSpec(
+        key="add",
+        title="校验 张量加法 | (16, N, 4096) 扫描",
+        sweep_label="N",
+        sweep_values=[512, 1024, 2048, 4096, 8192],
+        predictor_key="add",
+        build_predict_kwargs=lambda value: {"shape": (16, value, 4096)},
+        build_benchmark=lambda value: ADDBenchmark(
+            batch_size=16, seq_len=value, hidden_size=4096
+        ),
+    ),
+}
+
+
+KERNEL_REGISTRY = {
+    "mm": GEMMKernel,
+    "sdpa": SDPAKernel,
+    "rmsnorm": RMSNormKernel,
+    "softmax": SoftmaxKernel,
+    "ffn": FFNKernel,
+    "add": ADDKernel,
+}
+
+
+def _predict_operator(engine, spec, predict_kwargs):
+    if spec.key == "add":
+        return engine.predict_us(spec.predictor_key, *predict_kwargs["shape"])
+    return engine.predict_us(spec.predictor_key, **predict_kwargs)
+
+
+def run_operator(spec, engine, profiler):
+    print(f"\n {spec.title}")
+    print(f"{spec.sweep_label:<8} | {'预测(us)':<12} | {'实测(us)':<12} | {'误差 %':<8}")
     print("-" * 50)
-    for M in [512, 2048, 8192, 16384]:
-        pred = engine.predict_us("mm", M=M, K=K, N=N)
-        real = MatmulBenchmark(M=M, K=K, N=N).run() * 1e6
-        error = abs(pred - real) / real * 100
-        print(f"{M:<8} | {pred:<12.2f} | {real:<12.2f} | {error:.1f}%")
 
-def test_sdpa(engine):
-    print(f"\n 校验 FlashAttention (SDPA) | Sequence Length 扫描")
-    print(f"{'SeqLen':<8} | {'预测(us)':<12} | {'实测(us)':<12} | {'误差 %':<8}")
-    print("-" * 50)
-    for S in [512, 1024, 2048, 4096]:
-        pred = engine.predict_us("sdpa", B=4, H=32, S=S, D=128)
-        real = SDPABenchmark(batch_size=4, num_heads=32, seq_len=S, head_dim=128).run() * 1e6
-        error = abs(pred - real) / real * 100
-        print(f"{S:<8} | {pred:<12.2f} | {real:<12.2f} | {error:.1f}%")
+    predicted_values = []
+    actual_values = []
 
-def test_rmsnorm(engine):
-    print(f"\n 校验 RMSNorm | Sequence Length 扫描")
-    print(f"{'SeqLen':<8} | {'预测(us)':<12} | {'实测(us)':<12} | {'误差 %':<8}")
-    print("-" * 50)
-    for S in [512, 1024, 2048, 4096]:
-        pred = engine.predict_us("rmsnorm", B=4, S=S, H=128)
-        real = RMSNormBenchmark(batch_size=4, seq_len=S, hidden_size=128).run() * 1e6
-        error = abs(pred - real) / real * 100
-        print(f"{S:<8} | {pred:<12.2f} | {real:<12.2f} | {error:.1f}%")
+    for sweep_value in spec.sweep_values:
+        predict_kwargs = spec.build_predict_kwargs(sweep_value)
+        benchmark = spec.build_benchmark(sweep_value)
+        predicted_us = _predict_operator(engine, spec, predict_kwargs)
+        actual_us = benchmark.run() * 1e6
+        error_pct = abs(predicted_us - actual_us) / actual_us * 100
+        predicted_values.append(predicted_us)
+        actual_values.append(actual_us)
 
-def test_softmax(engine):
-    print(f"\n 校验 Softmax | Sequence Length 扫描")
-    print(f"{'SeqLen':<8} | {'预测(us)':<12} | {'实测(us)':<12} | {'误差 %':<8}")
-    print("-" * 50)
-    for S in [512, 1024, 2048, 4096, 8192]:
-        pred = engine.predict_us("softmax", 4, 32, S)
-        real = SoftmaxBenchmark(batch_size=4, num_heads=32, seq_len=S).run() * 1e6
-        error = abs(pred - real) / real * 100
-        print(f"{S:<8} | {pred:<12.2f} | {real:<12.2f} | {error:.1f}%")
+        print(f"{sweep_value:<8} | {predicted_us:<12.2f} | {actual_us:<12.2f} | {error_pct:.1f}%")
 
-def test_add(engine):
-    print(f"\n 校验 张量加法 | Sequence Length 扫描")
-    print(f"{'SeqLen':<8} | {'预测(us)':<12} | {'实测(us)':<12} | {'误差 %':<8}")
-    print("-" * 50)
-    for S in [512, 1024, 2048, 4096, 8192]:
-        pred = engine.predict_us("add", 16, S, 4096)
-        real = ADDBenchmark(batch_size=16, seq_len=S, hidden_size=4096).run() * 1e6
-        error = abs(pred - real) / real * 100
-        print(f"{S:<8} | {pred:<12.2f} | {real:<12.2f} | {error:.1f}%")
+    engine.update_kernel_from_measurements(spec.key, predicted_values, actual_values)
 
-# ==========================================
-# CLI 入口与调度中心
-# ==========================================
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="LLM算子性能预测与实测对比引擎")
+    parser.add_argument(
+        "-t",
+        "--tests",
+        nargs="+",
+        choices=list(OPERATOR_SPECS.keys()) + ["all"],
+        default=["all"],
+        help="指定要运行的测试项 (支持多选，默认运行所有)。",
+    )
+    parser.add_argument(
+        "--force-remeasure",
+        action="store_true",
+        help="忽略 device_profiles.yaml 缓存，强制重新实测硬件探针。",
+    )
+    return parser
+
 
 def main():
-    # 1. 配置命令行参数解析
-    parser = argparse.ArgumentParser(description="LLM算子性能预测与实测对比引擎")
-    
-    # 注册支持的测试项映射字典
-    TEST_MAP = {
-        "mm": test_matmul,
-        "sdpa": test_sdpa,
-        "rmsnorm": test_rmsnorm,
-        "softmax": test_softmax,
-        "add": test_add
-    }
-    
-    parser.add_argument(
-        "-t", "--tests", 
-        nargs="+", 
-        choices=list(TEST_MAP.keys()) + ["all"], 
-        default=["all"],
-        help="指定要运行的测试项 (支持多选，默认运行所有)。"
-    )
-    
+    parser = build_parser()
     args = parser.parse_args()
 
-    # 2. 解析需要运行的任务列表
     if "all" in args.tests:
-        tasks_to_run = list(TEST_MAP.keys())
+        tasks_to_run = list(OPERATOR_SPECS.keys())
     else:
         tasks_to_run = list(dict.fromkeys(args.tests))
 
-    # 3. 初始化硬件环境与预测引擎 (延迟初始化，避免没跑任务却占显存)
     print("正在初始化硬件探针并注册预测内核...")
-    hw = HardwareProfiler().profile_hardware()
+    hw = HardwareProfiler().profile_hardware(force_remeasure=args.force_remeasure)
     engine = PredictorEngine(hw)
-    
-    engine.register_kernel("mm", GEMMKernel)
-    engine.register_kernel("sdpa", SDPAKernel)
-    engine.register_kernel("rmsnorm", RMSNormKernel)
-    engine.register_kernel("softmax", SoftmaxKernel)
-    engine.register_kernel("ffn", FFNKernel)
-    engine.register_kernel("add", ADDKernel)
 
-    # 4. 循环调度执行任务
+    for kernel_name, kernel_class in KERNEL_REGISTRY.items():
+        engine.register_kernel(kernel_name, kernel_class)
+
     for task_name in tasks_to_run:
-        func = TEST_MAP[task_name]
-        func(engine)
-        
+        run_operator(OPERATOR_SPECS[task_name], engine, hw)
+
+    hw.set_calibration(engine.export_calibration())
+    hw.save_profile()
+    print(f"\n 已同步硬件profile和参数到 {hw.cache_path}")
     print("\n 所有指定测试项执行完毕。")
+
 
 if __name__ == "__main__":
     main()

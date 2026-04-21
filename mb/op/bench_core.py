@@ -1,16 +1,28 @@
 import torch
 import torch.utils.benchmark as benchmark
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 import numpy as np
 import torch.distributed as dist
 class OperatorBenchmark:
-    def __init__(self, name: str, description: str, device="cuda", dtype=torch.bfloat16):
+    def __init__(self, name: str, description: str, device="musa", dtype=torch.float16):
         self.name = name
         self.description = description
         self.device = torch.device(device)
         self.dtype = dtype
         self.inputs = {}
         self.grad_output = None
+
+    def _empty_cache(self):
+        if self.device.type == "musa":
+            torch.musa.empty_cache()
+        elif self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def _sync_device(self):
+        if self.device.type == "musa":
+            torch.musa.synchronize()
+        elif self.device.type == "cuda":
+            torch.cuda.synchronize()
 
     def prepare_inputs(self):
         raise NotImplementedError
@@ -30,7 +42,7 @@ class OperatorBenchmark:
         out.backward(self.grad_output, retain_graph=True)
 
     def run(self, min_run_time=0.2, test_backward=False):
-        torch.cuda.empty_cache()
+        self._empty_cache()
         self.prepare_inputs()
         
         timer_fwd = benchmark.Timer(
@@ -42,6 +54,7 @@ class OperatorBenchmark:
         
         # 提取精确的中位数时间 (秒)
         measurement = timer_fwd.blocked_autorange(min_run_time=min_run_time)
+        self._sync_device()
         return measurement.median
 
 class MatmulBenchmark(OperatorBenchmark):
@@ -225,7 +238,7 @@ class AllReduceBenchmark(OperatorBenchmark):
         """
         重写 run 方法：为了保证测试准确，NCCL 压测前后建议加入分布式屏障 (Barrier)
         """
-        torch.cuda.empty_cache()
+        self._empty_cache()
         self.prepare_inputs()
         
         # 保证所有卡都在同一起跑线
@@ -240,6 +253,7 @@ class AllReduceBenchmark(OperatorBenchmark):
         
         # 提取精确的中位数时间
         measurement = timer_fwd.blocked_autorange(min_run_time=min_run_time)
+        self._sync_device()
         
         # 测试结束后再次同步
         dist.barrier()

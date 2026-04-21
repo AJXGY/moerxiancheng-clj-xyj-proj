@@ -13,6 +13,6 @@
 <text x="560" y="118" font-size="18" font-family="Arial, Helvetica, sans-serif" fill="#0f172a" font-weight="700">并行策略</text>
 <text x="560" y="150" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">数据并行: 2</text>
 <text x="560" y="175" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">流水线并行: 2</text>
-<text x="560" y="200" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">张量并行: 1</text>
+<text x="560" y="200" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">张量并行: 未启用（size=1）</text>
 <text x="560" y="225" font-size="14" font-family="Arial, Helvetica, sans-serif" fill="#334155">ZeRO Stage: 1</text>
 </svg>

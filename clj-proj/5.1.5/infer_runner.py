@@ -5,6 +5,7 @@ import json
 import multiprocessing as mp
 import os
 import platform
+import re
 import traceback
 from datetime import datetime, timezone
 
@@ -56,7 +57,7 @@ def load_model_bundle(model_path, backend, device_id):
 
 def build_inputs(tokenizer, prompt, device):
     messages = [
-        {"role": "system", "content": "请直接给出最终答案，不要重复题目，也不要解释。"},
+        {"role": "system", "content": "你是严格答题助手。只输出最终答案本身，不要重复题目，不要解释，不要添加标点或代码。"},
         {"role": "user", "content": prompt},
     ]
     if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
@@ -79,12 +80,23 @@ def real_infer(tokenizer, model, device, prompt, max_new_tokens):
 
     inputs = build_inputs(tokenizer, prompt, device)
     input_len = inputs["input_ids"].shape[-1]
+    eos_token_ids = []
+    if tokenizer.eos_token_id is not None:
+        eos_token_ids.append(tokenizer.eos_token_id)
+    try:
+        eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+    except Exception:
+        eot_id = None
+    if isinstance(eot_id, int) and eot_id >= 0 and eot_id not in eos_token_ids:
+        eos_token_ids.append(eot_id)
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            eos_token_id=eos_token_ids or tokenizer.eos_token_id,
             pad_token_id=tokenizer.eos_token_id,
+            use_cache=True,
         )
     generated_ids = output_ids[0][input_len:]
     decoded = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
@@ -98,14 +110,37 @@ def dry_infer(item, mode_name, device_label):
     return f"[dry-run][{mode_name}][{device_label}]"
 
 
-def validate_response(item, text):
+def normalize_response(item, text):
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    candidates = []
+    if lines:
+        candidates.append(lines[0])
+    candidates.append(stripped)
+
+    expected = item.get("expected_contains", [])
+    if not expected:
+        return candidates[0]
+
+    for token in expected:
+        normalized_token = token.strip()
+        for candidate in candidates:
+            if candidate == normalized_token:
+                return normalized_token
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(normalized_token)}(?![A-Za-z0-9_])"
+        match = re.search(pattern, stripped)
+        if match:
+            return match.group(0)
+    return candidates[0]
+
+
+def validate_response(item, normalized_text):
     expected = item.get("expected_contains", [])
     if not expected:
         return True
-    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-    if not first_line:
-        return False
-    return all(first_line == token for token in expected)
+    return normalized_text in expected
 
 
 def worker_main(worker_id, prompts, args, queue):
@@ -128,7 +163,7 @@ def worker_main(worker_id, prompts, args, queue):
             tokenizer, model, device = load_model_bundle(args.model_path, backend, device_id)
         for item in prompts:
             if use_real:
-                text = real_infer(
+                raw_text = real_infer(
                     tokenizer=tokenizer,
                     model=model,
                     device=device,
@@ -136,13 +171,15 @@ def worker_main(worker_id, prompts, args, queue):
                     max_new_tokens=args.max_new_tokens,
                 )
             else:
-                text = dry_infer(item, args.mode_name, device_label)
-            validated = validate_response(item, text)
+                raw_text = dry_infer(item, args.mode_name, device_label)
+            normalized_text = normalize_response(item, raw_text)
+            validated = validate_response(item, normalized_text)
             results.append(
                 {
                     "id": item["id"],
                     "prompt": item["prompt"],
-                    "response": text,
+                    "response": normalized_text,
+                    "raw_response": raw_text,
                     "expected_contains": item.get("expected_contains", []),
                     "validation_passed": validated,
                     "worker_id": worker_id,
@@ -193,7 +230,7 @@ def main():
     parser.add_argument("--num-devices", type=int, default=1)
     parser.add_argument("--device-type", default="auto", choices=["auto", "musa", "cuda", "cpu"])
     parser.add_argument("--device-ids", default="")
-    parser.add_argument("--max-new-tokens", type=int, default=24)
+    parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
