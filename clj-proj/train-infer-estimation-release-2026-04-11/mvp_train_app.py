@@ -124,7 +124,13 @@ def main() -> None:
     dtype_name = str(parallel_cfg.get("dtype") or model_desc.get("dtype") or "float16").lower()
     dtype = torch.bfloat16 if dtype_name in {"bf16", "bfloat16"} else torch.float16
 
-    if request.get("skip_calibration"):
+    disable_runtime_probe = bool(request.get("disable_runtime_probe"))
+    direct_profile_mode = (
+        request.get("runtime_profile") is None
+        and model_desc.get("train_workload") == "llama_backbone_probe"
+        and not disable_runtime_probe
+    )
+    if request.get("skip_calibration") or direct_profile_mode:
         calibration = HardwareCalibration(
             device_name=f"{device_backend}:profile_reuse",
             device_index=runtime_index,
@@ -141,15 +147,16 @@ def main() -> None:
         physical_devices=physical_devices,
     )
     runtime_profile = request.get("runtime_profile")
-    profile_source = "request_runtime_profile" if runtime_profile is not None else "online_runtime_probe"
+    profile_source = "request_runtime_profile" if runtime_profile is not None else "analytical_only" if disable_runtime_probe else "online_runtime_probe"
     if runtime_profile is None:
-        profile_runs = 1 if model_desc.get("train_workload") == "llama_backbone_probe" else 3
-        runtime_profile = benchmark_train_microbatch_ms(
-            model_desc=model_desc,
-            parallel_cfg=parallel_cfg,
-            device_backend=device_backend,
-            runs=profile_runs,
-        )
+        if not disable_runtime_probe:
+            profile_runs = 5 if model_desc.get("train_workload") == "llama_backbone_probe" else 3
+            runtime_profile = benchmark_train_microbatch_ms(
+                model_desc=model_desc,
+                parallel_cfg=parallel_cfg,
+                device_backend=device_backend,
+                runs=profile_runs,
+            )
     estimate = estimate_train_iteration(
         model_desc=model_desc,
         parallel_cfg=parallel_cfg,

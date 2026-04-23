@@ -145,17 +145,28 @@ set -e
 SINGLE_END_TIME=$(date +%s)
 SINGLE_DURATION=$((SINGLE_END_TIME - SINGLE_START_TIME))
 
-# 生成单卡结果状态
-if [[ ${SINGLE_RC} -eq 0 ]]; then
-  SINGLE_SUCCESS=true
-  SINGLE_ERRORS='[]'
+# 如 train_runner 已写入更完整 summary，则只补充 execution_time_seconds；
+# 否则回退到兼容格式，避免覆盖主 runtime 产物。
+if [[ -f "${SINGLE_OUTPUT_DIR}/summary.json" ]]; then
+  python3 - "${SINGLE_OUTPUT_DIR}/summary.json" "${SINGLE_DURATION}" <<'PY'
+import json, sys
+path = sys.argv[1]
+duration = int(sys.argv[2])
+with open(path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+payload["execution_time_seconds"] = duration
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, ensure_ascii=False, indent=2)
+PY
 else
-  SINGLE_SUCCESS=false
-  SINGLE_ERRORS='["train_runner_exit_code:'"${SINGLE_RC}"'"]'
-fi
-
-# 生成单卡结果JSON
-cat > "${SINGLE_OUTPUT_DIR}/summary.json" <<EOF
+  if [[ ${SINGLE_RC} -eq 0 ]]; then
+    SINGLE_SUCCESS=true
+    SINGLE_ERRORS='[]'
+  else
+    SINGLE_SUCCESS=false
+    SINGLE_ERRORS='["train_runner_exit_code:'"${SINGLE_RC}"'"]'
+  fi
+  cat > "${SINGLE_OUTPUT_DIR}/summary.json" <<EOF
 {
   "test_id": "MTT-TRAIN-RUN-TEST-SINGLE",
   "model_path": "${MODEL_PATH}",
@@ -168,6 +179,7 @@ cat > "${SINGLE_OUTPUT_DIR}/summary.json" <<EOF
   "errors": ${SINGLE_ERRORS}
 }
 EOF
+fi
 
 echo "✓ 单卡训练完成，结果：${SINGLE_OUTPUT_DIR}"
 echo ""
@@ -208,17 +220,26 @@ set -e
 DUAL_END_TIME=$(date +%s)
 DUAL_DURATION=$((DUAL_END_TIME - DUAL_START_TIME))
 
-# 生成双卡结果状态
-if [[ ${DUAL_RC} -eq 0 ]]; then
-  DUAL_SUCCESS=true
-  DUAL_ERRORS='[]'
+if [[ -f "${DUAL_OUTPUT_DIR}/summary.json" ]]; then
+  python3 - "${DUAL_OUTPUT_DIR}/summary.json" "${DUAL_DURATION}" <<'PY'
+import json, sys
+path = sys.argv[1]
+duration = int(sys.argv[2])
+with open(path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+payload["execution_time_seconds"] = duration
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, ensure_ascii=False, indent=2)
+PY
 else
-  DUAL_SUCCESS=false
-  DUAL_ERRORS='["train_runner_exit_code:'"${DUAL_RC}"'"]'
-fi
-
-# 生成双卡结果JSON
-cat > "${DUAL_OUTPUT_DIR}/summary.json" <<EOF
+  if [[ ${DUAL_RC} -eq 0 ]]; then
+    DUAL_SUCCESS=true
+    DUAL_ERRORS='[]'
+  else
+    DUAL_SUCCESS=false
+    DUAL_ERRORS='["train_runner_exit_code:'"${DUAL_RC}"'"]'
+  fi
+  cat > "${DUAL_OUTPUT_DIR}/summary.json" <<EOF
 {
   "test_id": "MTT-TRAIN-RUN-TEST-DUAL",
   "model_path": "${MODEL_PATH}",
@@ -231,6 +252,7 @@ cat > "${DUAL_OUTPUT_DIR}/summary.json" <<EOF
   "errors": ${DUAL_ERRORS}
 }
 EOF
+fi
 
 echo "✓ 双卡训练完成，结果：${DUAL_OUTPUT_DIR}"
 echo ""

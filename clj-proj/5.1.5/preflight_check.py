@@ -49,7 +49,13 @@ def detect_accelerator():
     if not result["torch_available"]:
         return result
 
-    import torch
+    # Attempt to import torch but handle import errors gracefully (e.g., missing shared libs)
+    try:
+        import torch
+    except Exception as exc:  # pragma: no cover - defensive
+        result["torch_import_error"] = str(exc)
+        # leave backend as cpu and return available info
+        return result
 
     if result["torch_musa_available"]:
         try:
@@ -63,12 +69,15 @@ def detect_accelerator():
         except Exception as exc:
             result["musa_error"] = str(exc)
 
-    if torch.cuda.is_available():
-        count = torch.cuda.device_count()
-        result["backend"] = "cuda"
-        result["device_count"] = count
-        result["devices"] = [f"cuda:{idx}" for idx in range(count)]
-        return result
+    try:
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            result["backend"] = "cuda"
+            result["device_count"] = count
+            result["devices"] = [f"cuda:{idx}" for idx in range(count)]
+            return result
+    except Exception as exc:  # pragma: no cover - defensive
+        result["cuda_error"] = str(exc)
 
     return result
 

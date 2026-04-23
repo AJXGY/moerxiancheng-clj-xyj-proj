@@ -43,6 +43,7 @@ def main():
     actual_gpu_devices = sorted(model["task_assignment"]["gpu"].keys())
     pipeline_stages = model["partitioning"]["pipeline_stages"]
     dag_nodes = model["dag"]["nodes"]
+    runtime_observation = model.get("runtime_observation")
 
     checks = [
         {
@@ -116,6 +117,26 @@ def main():
             "id": "dag_edge_count_consistent",
             "passed": model["dag"]["edge_count"] == sum(len(node["depends_on"]) for node in dag_nodes),
             "detail": f"edge_count={model['dag']['edge_count']}",
+        },
+        {
+            "id": "runtime_observation_present",
+            "passed": runtime_observation is not None,
+            "detail": "runtime_observation embedded in execution model" if runtime_observation is not None else "missing",
+        },
+        {
+            "id": "runtime_backend_matches_mapping",
+            "passed": runtime_observation is not None and runtime_observation.get("backend") == "musa",
+            "detail": f"backend={None if runtime_observation is None else runtime_observation.get('backend')}",
+        },
+        {
+            "id": "runtime_pipeline_matches_task",
+            "passed": runtime_observation is not None and int(runtime_observation.get("pipeline_parallel_size", -1)) == task["parallelism"]["pipeline_parallel_size"],
+            "detail": f"expected={task['parallelism']['pipeline_parallel_size']}, actual={None if runtime_observation is None else runtime_observation.get('pipeline_parallel_size')}",
+        },
+        {
+            "id": "runtime_probe_succeeded",
+            "passed": runtime_observation is not None and bool(runtime_observation.get("success")),
+            "detail": "success=True" if runtime_observation is not None and runtime_observation.get("success") else f"observation={runtime_observation}",
         },
     ]
 

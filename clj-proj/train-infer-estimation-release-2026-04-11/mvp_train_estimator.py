@@ -172,7 +172,7 @@ def benchmark_train_microbatch_ms(
             global_batch_size=int(parallel_cfg.get("global_batch_size", 8)),
             device_backend=device_backend,
             runs=runs,
-            warmups=1,
+            warmups=2,
             max_seq_len=int(model_desc.get("max_seq_len", 8)),
             split_index=int(model_desc.get("pipeline_split_index", 16)),
             lora_rank=int(model_desc.get("lora_rank", 8)),

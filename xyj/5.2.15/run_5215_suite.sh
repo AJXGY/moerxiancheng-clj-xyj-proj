@@ -22,7 +22,26 @@ if [[ ${#EXTRA_LD_PATHS[@]} -gt 0 ]]; then
 	export LD_LIBRARY_PATH="${EXTRA_JOINED}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
-python3 benchmark_parallel_infer_time.py
+SINGLE_ONLY="false"
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--single-only)
+			SINGLE_ONLY="true"
+			shift
+			;;
+		*)
+			echo "Unknown arg: $1" >&2
+			exit 1
+			;;
+	esac
+done
+
+BENCH_ARGS=()
+if [[ "${SINGLE_ONLY}" == "true" ]]; then
+	BENCH_ARGS+=(--single-only)
+fi
+
+python3 benchmark_parallel_infer_time.py "${BENCH_ARGS[@]}"
 python3 fit_time_model.py
 python3 generate_charts.py
 python3 summarize_results.py

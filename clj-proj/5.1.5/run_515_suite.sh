@@ -8,6 +8,8 @@ DEVICE_TYPE="auto"
 SINGLE_DEVICE_IDS="0"
 DUAL_DEVICE_IDS="0,1"
 DRY_RUN="false"
+SINGLE_ONLY="false"
+MAX_NEW_TOKENS="8"
 EXTRA_LD_PATHS=()
 
 for candidate in \
@@ -53,6 +55,14 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN="true"
       shift
       ;;
+    --single-only)
+      SINGLE_ONLY="true"
+      shift
+      ;;
+    --max-new-tokens)
+      MAX_NEW_TOKENS="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown arg: $1" >&2
       exit 1
@@ -62,7 +72,10 @@ done
 
 STAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
 ARTIFACT_DIR="${ROOT_DIR}/artifacts/${STAMP}"
-mkdir -p "${ARTIFACT_DIR}/preflight" "${ARTIFACT_DIR}/single" "${ARTIFACT_DIR}/dual"
+mkdir -p "${ARTIFACT_DIR}/preflight" "${ARTIFACT_DIR}/single"
+if [[ "${SINGLE_ONLY}" != "true" ]]; then
+  mkdir -p "${ARTIFACT_DIR}/dual"
+fi
 
 python3 "${ROOT_DIR}/preflight_check.py" \
   --output "${ARTIFACT_DIR}/preflight/preflight.json"
@@ -82,21 +95,31 @@ python3 "${ROOT_DIR}/infer_runner.py" \
   --num-devices 1 \
   --device-type "${DEVICE_TYPE}" \
   --device-ids "${SINGLE_DEVICE_IDS}" \
+  --max-new-tokens "${MAX_NEW_TOKENS}" \
   "${SINGLE_ARGS[@]}"
 
-python3 "${ROOT_DIR}/infer_runner.py" \
-  --model-path "${MODEL_PATH}" \
-  --prompts-file "${PROMPTS_FILE}" \
-  --output-dir "${ARTIFACT_DIR}/dual" \
-  --mode-name dual \
-  --num-devices 2 \
-  --device-type "${DEVICE_TYPE}" \
-  --device-ids "${DUAL_DEVICE_IDS}" \
-  "${DUAL_ARGS[@]}"
+if [[ "${SINGLE_ONLY}" != "true" ]]; then
+  python3 "${ROOT_DIR}/infer_runner.py" \
+    --model-path "${MODEL_PATH}" \
+    --prompts-file "${PROMPTS_FILE}" \
+    --output-dir "${ARTIFACT_DIR}/dual" \
+    --mode-name dual \
+    --num-devices 2 \
+    --device-type "${DEVICE_TYPE}" \
+    --device-ids "${DUAL_DEVICE_IDS}" \
+    --max-new-tokens "${MAX_NEW_TOKENS}" \
+    "${DUAL_ARGS[@]}"
+fi
+
+SUMMARY_ARGS=()
+if [[ "${SINGLE_ONLY}" == "true" ]]; then
+  SUMMARY_ARGS+=(--single-only)
+fi
 
 python3 "${ROOT_DIR}/summarize_results.py" \
   --artifacts-dir "${ARTIFACT_DIR}" \
-  --output "${ARTIFACT_DIR}/5.1.5任务进展.md"
+  --output "${ARTIFACT_DIR}/5.1.5任务进展.md" \
+  "${SUMMARY_ARGS[@]}"
 
 cp "${ARTIFACT_DIR}/5.1.5任务进展.md" "${ROOT_DIR}/5.1.5任务进展.md"
 

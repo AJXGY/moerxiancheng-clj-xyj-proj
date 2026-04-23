@@ -1,66 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-5.1.6 训练运行器 - 摩尔线程架构上训练任务
-MTT-TRAIN-RUN-TEST Training Runner
-
-说明：
-- 该脚本执行真实模型加载与真实前向计算。
-- 为保证在 8B 模型上可稳定运行，训练目标采用 LoRA 风格低秩适配器参数更新（非全量微调）。
-- 单卡与双卡模式均会执行真实计算并输出可复核指标与 checkpoint。
-"""
+from __future__ import annotations
 
 import argparse
 import json
-import logging
-import multiprocessing as mp
 import os
-import platform
-import traceback
-from dataclasses import dataclass
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+ROOT = os.path.dirname(os.path.abspath(__file__))
+TOOL_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(ROOT)),
+    "clj-proj",
+    "train-infer-estimation-release-2026-04-11",
 )
-logger = logging.getLogger(__name__)
 
+if TOOL_ROOT not in sys.path:
+    sys.path.insert(0, TOOL_ROOT)
 
-@dataclass
-class RuntimeConfig:
-    max_steps: int
-    max_seq_len: int
-    learning_rate: float
-    device_type: str
-    lora_rank: int
-    lora_alpha: float
-
-
-class LoraProbeHead:
-    def __init__(self, hidden_size: int, rank: int, alpha: float, device: str):
-        import torch
-
-        self.lora_a = torch.nn.Linear(hidden_size, rank, bias=False, device=device)
-        self.lora_b = torch.nn.Linear(rank, hidden_size, bias=False, device=device)
-        torch.nn.init.kaiming_uniform_(self.lora_a.weight, a=5**0.5)
-        torch.nn.init.zeros_(self.lora_b.weight)
-        self.scale = alpha / float(rank)
-
-    def parameters(self):
-        return list(self.lora_a.parameters()) + list(self.lora_b.parameters())
-
-    def loss(self, hidden):
-        adapted = hidden.float() + self.lora_b(self.lora_a(hidden.float())) * self.scale
-        return (adapted ** 2).mean()
+from mvp_llama_train_runtime import LlamaTrainRuntime, _synchronize  # type: ignore
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="5.1.6 Training Runner")
+    parser = argparse.ArgumentParser(description="5.1.6 Training Runner using train-infer-estimation runtime")
     parser.add_argument("--model_path", type=str, required=True, help="Model path")
     parser.add_argument("--config_file", type=str, required=True, help="Config file")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
@@ -78,72 +44,52 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_config(config_file: str) -> Dict[str, Any]:
-    logger.info("Loading config from: %s", config_file)
+def load_config(config_file: str) -> dict[str, Any]:
     with open(config_file, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    logger.info("Config loaded successfully")
-    return config
+        return json.load(f)
 
 
-def detect_backend(requested: str) -> str:
-    if requested != "auto":
-        return requested
-
-    try:
-        import torch  # noqa: F401
-    except Exception:
-        return "cpu"
-
+def detect_backend() -> dict[str, Any]:
     try:
         import torch_musa  # noqa: F401
         import torch
 
         if hasattr(torch, "musa") and torch.musa.is_available():
-            return "musa"
+            return {
+                "backend": "musa",
+                "device_count": int(torch.musa.device_count()),
+                "device_names": [torch.musa.get_device_name(i) for i in range(torch.musa.device_count())],
+            }
     except Exception:
         pass
 
-    import torch
+    try:
+        import torch
 
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
+        if torch.cuda.is_available():
+            return {
+                "backend": "cuda",
+                "device_count": int(torch.cuda.device_count()),
+                "device_names": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+            }
+    except Exception:
+        pass
+
+    return {"backend": "cpu", "device_count": 0, "device_names": []}
 
 
-def parse_device_ids(raw: str, num_gpus: int) -> List[int]:
+def parse_device_ids(raw: str, num_gpus: int) -> list[int]:
     ids = [int(item.strip()) for item in raw.split(",") if item.strip()]
     if ids:
         return ids
     return list(range(max(1, num_gpus)))
 
 
-def runtime_from_config(config: Dict[str, Any], device_type: str) -> RuntimeConfig:
-    training = config.get("training_config", {})
-    data_cfg = config.get("data_config", {})
-    max_steps = int(training.get("max_steps", 6))
-    # Cap steps for stable, repeatable runtime in CI-like environments.
-    max_steps = max(2, min(max_steps, 8))
-    max_seq_len = int(data_cfg.get("max_seq_len", 64))
-    max_seq_len = max(8, min(max_seq_len, 64))
-    learning_rate = float(training.get("learning_rate", 1e-3))
-    learning_rate = max(1e-5, min(learning_rate, 1e-2))
-    lora_cfg = config.get("lora_config", {})
-    return RuntimeConfig(
-        max_steps=max_steps,
-        max_seq_len=max_seq_len,
-        learning_rate=learning_rate,
-        device_type=device_type,
-        lora_rank=int(lora_cfg.get("lora_rank", 8)),
-        lora_alpha=float(lora_cfg.get("lora_alpha", 16.0)),
-    )
-
-
-def load_prompts_from_train_data(model_path: str) -> List[str]:
-    train_data = Path(__file__).resolve().parent / "train_data.jsonl"
-    prompts: List[str] = []
-    if train_data.exists():
-        for line in train_data.read_text(encoding="utf-8").splitlines():
+def load_train_texts() -> list[str]:
+    data_path = Path(ROOT) / "train_data.jsonl"
+    texts: list[str] = []
+    if data_path.exists():
+        for line in data_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -151,329 +97,204 @@ def load_prompts_from_train_data(model_path: str) -> List[str]:
                 item = json.loads(line)
                 text = item.get("instruction") or item.get("prompt") or item.get("input") or ""
                 if text:
-                    prompts.append(str(text))
+                    texts.append(str(text))
             except Exception:
                 continue
-    if not prompts:
-        prompts = [
-            "请简要说明摩尔线程GPU在训练中的作用。",
-            "给出一个深度学习训练中的梯度下降示例。",
-            "解释为什么多卡训练需要通信同步。",
+    if not texts:
+        texts = [
+            "解释为什么大模型训练需要多卡并行。",
+            "说明 LoRA 微调在训练中的作用。",
+            "摩尔线程 GPU 在训练链路中的职责是什么？",
         ]
-    return prompts
+    return texts
 
 
-def build_device(backend: str, device_id: int) -> str:
-    if backend == "cpu":
-        return "cpu"
-    return f"{backend}:{device_id}"
+def ensure_runtime_samples(texts: list[str], output_dir: Path) -> Path:
+    path = output_dir / "runtime_samples.jsonl"
+    with path.open("w", encoding="utf-8") as f:
+        for index, text in enumerate(texts):
+            f.write(json.dumps({"text": text, "label": index % 2}, ensure_ascii=False) + "\n")
+    return path
 
 
-def load_model_and_tokenizer(model_path: str, backend: str, device_id: int):
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    if backend == "musa":
-        import torch_musa  # noqa: F401
-
-    device = build_device(backend, device_id)
-    dtype = torch.float16 if backend in {"musa", "cuda"} else torch.float32
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    )
-    model.eval()
-    model.to(device)
-    return tokenizer, model, device
+def trainable_modules(runtime: LlamaTrainRuntime) -> list[Any]:
+    modules = []
+    if hasattr(runtime, "head"):
+        modules.append(runtime.head)
+    if hasattr(runtime, "tp_heads"):
+        modules.append(runtime.tp_heads)
+    return modules
 
 
-def run_probe_training(
-    model_path: str,
-    runtime_cfg: RuntimeConfig,
-    prompts: List[str],
-    output_dir: str,
-    worker_rank: int,
-    device_id: int,
-) -> Dict[str, Any]:
+def parameter_norm(modules: list[Any]) -> float:
+    total = 0.0
+    for module in modules:
+        for param in module.parameters():
+            total += float(param.detach().float().norm().item())
+    return total
+
+
+def module_state_to_cpu(module) -> dict[str, Any]:
+    state = {}
+    for key, value in module.state_dict().items():
+        state[key] = value.detach().cpu()
+    return state
+
+
+def save_checkpoint(runtime: LlamaTrainRuntime, mode_name: str, output_dir: Path) -> Path:
     import torch
 
-    backend = runtime_cfg.device_type
-    tokenizer, model, device = load_model_and_tokenizer(model_path, backend, device_id)
-
-    # Freeze the 8B backbone and optimize only a LoRA-style low-rank adapter.
-    for p in model.parameters():
-        p.requires_grad_(False)
-
-    hidden_size = int(getattr(model.config, "hidden_size", 4096))
-    lora_head = LoraProbeHead(
-        hidden_size=hidden_size,
-        rank=runtime_cfg.lora_rank,
-        alpha=runtime_cfg.lora_alpha,
-        device=device,
-    )
-    optimizer = torch.optim.AdamW(lora_head.parameters(), lr=runtime_cfg.learning_rate)
-
-    losses: List[float] = []
-    started_at = datetime.now(timezone.utc).isoformat()
-
-    for step in range(runtime_cfg.max_steps):
-        text = prompts[step % len(prompts)]
-        encoded = tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=runtime_cfg.max_seq_len,
-            padding=False,
-        )
-        encoded = {k: v.to(device) for k, v in encoded.items()}
-
-        # Run real backbone compute without gradients for model weights.
-        with torch.no_grad():
-            if hasattr(model, "model"):
-                base_out = model.model(
-                    input_ids=encoded["input_ids"],
-                    attention_mask=encoded.get("attention_mask"),
-                    use_cache=False,
-                    return_dict=True,
-                )
-                hidden = base_out.last_hidden_state
-            else:
-                full_out = model(
-                    input_ids=encoded["input_ids"],
-                    attention_mask=encoded.get("attention_mask"),
-                    use_cache=False,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-                hidden = full_out.hidden_states[-1]
-
-        optimizer.zero_grad(set_to_none=True)
-        loss = lora_head.loss(hidden)
-        loss.backward()
-        optimizer.step()
-
-        loss_value = float(loss.detach().cpu().item())
-        losses.append(loss_value)
-        if (step + 1) % 2 == 0:
-            logger.info("Device %s step %d/%d loss=%.6f", device, step + 1, runtime_cfg.max_steps, loss_value)
-
-    ckpt_dir = Path(output_dir) / "checkpoints" / f"checkpoint-final-rank{worker_rank}-device{device_id}"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / "probe_state.pt"
-    torch.save(
-        {
-            "lora_rank": runtime_cfg.lora_rank,
-            "lora_alpha": runtime_cfg.lora_alpha,
-            "lora_a_norm": float(lora_head.lora_a.weight.detach().float().norm().cpu().item()),
-            "lora_b_norm": float(lora_head.lora_b.weight.detach().float().norm().cpu().item()),
-            "optimizer_state": optimizer.state_dict(),
-            "steps": runtime_cfg.max_steps,
-            "backend": backend,
-            "device": device,
-            "model_path": model_path,
-        },
-        ckpt_path,
-    )
-
-    finished_at = datetime.now(timezone.utc).isoformat()
-    return {
-        "device_id": device_id,
-        "device": device,
-        "backend": backend,
-        "steps": runtime_cfg.max_steps,
-        "loss_initial": losses[0] if losses else None,
-        "loss_final": losses[-1] if losses else None,
-        "losses": losses,
-        "checkpoint": str(ckpt_path),
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "success": True,
-        "errors": [],
-        "training_mode": "lora_probe",
-        "lora_rank": runtime_cfg.lora_rank,
-        "lora_alpha": runtime_cfg.lora_alpha,
+    payload: dict[str, Any] = {
+        "mode": mode_name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
-
-
-def worker_entry(worker_rank: int, worker_device_id: int, args: argparse.Namespace, runtime_cfg: RuntimeConfig, prompts: List[str], queue):
-    try:
-        payload = run_probe_training(
-            model_path=args.model_path,
-            runtime_cfg=runtime_cfg,
-            prompts=prompts,
-            output_dir=args.output_dir,
-            worker_rank=worker_rank,
-            device_id=worker_device_id,
-        )
-        payload["worker_rank"] = worker_rank
-    except Exception as exc:
-        payload = {
-            "worker_rank": worker_rank,
-            "device_id": worker_device_id,
-            "device": build_device(runtime_cfg.device_type, worker_device_id),
-            "backend": runtime_cfg.device_type,
-            "steps": runtime_cfg.max_steps,
-            "loss_initial": None,
-            "loss_final": None,
-            "losses": [],
-            "checkpoint": "",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "success": False,
-            "errors": [str(exc), traceback.format_exc()],
-            "training_mode": "lora_probe",
-        }
-    queue.put(payload)
-
-
-def run_single_or_dual(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
-    backend = detect_backend(config.get("hardware_config", {}).get("device_type", "auto"))
-    runtime_cfg = runtime_from_config(config, backend)
-    prompts = load_prompts_from_train_data(args.model_path)
-
-    device_ids = parse_device_ids(args.device_ids, args.num_gpus)
-    required_workers = 1 if args.num_gpus <= 1 else 2
-    device_ids = device_ids[:required_workers]
-
-    if args.dry_run:
-        return {
-            "mode": "dry_run",
-            "backend": backend,
-            "device_ids": device_ids,
-            "workers": [
-                {
-                    "device_id": device_ids[i],
-                    "device": build_device(backend, device_ids[i]),
-                    "success": True,
-                    "training_mode": "dry_run",
-                    "loss_initial": 1.0,
-                    "loss_final": 0.5,
-                    "steps": 1,
-                    "checkpoint": "",
-                    "errors": [],
-                }
-                for i in range(len(device_ids))
-            ],
-            "success": True,
-            "errors": [],
-        }
-
-    logger.info("Backend: %s | Worker devices: %s", backend, device_ids)
-
-    queue = mp.get_context("spawn").Queue()
-    processes = []
-    for worker_rank, worker_device_id in enumerate(device_ids):
-        p = mp.get_context("spawn").Process(
-            target=worker_entry,
-            args=(worker_rank, worker_device_id, args, runtime_cfg, prompts, queue),
-        )
-        p.start()
-        processes.append(p)
-
-    worker_payloads = [queue.get() for _ in processes]
-    for p in processes:
-        p.join()
-
-    errors: List[str] = []
-    for payload in worker_payloads:
-        if not payload.get("success", False):
-            errors.extend(payload.get("errors", []))
-
-    return {
-        "mode": "lora_probe",
-        "backend": backend,
-        "device_ids": device_ids,
-        "workers": sorted(worker_payloads, key=lambda x: x.get("worker_rank", x["device_id"])),
-        "success": len(errors) == 0,
-        "errors": errors,
-    }
-
-
-def write_training_metrics(output_dir: str, payload: Dict[str, Any]) -> str:
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    metrics = out / "training_metrics.json"
-    with open(metrics, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    return str(metrics)
-
-
-def setup_environment() -> bool:
-    logger.info("Setting up training environment...")
-    try:
-        import torch
-
-        logger.info("PyTorch version: %s", torch.__version__)
-        logger.info("CUDA available: %s", torch.cuda.is_available())
-        if hasattr(torch, "musa"):
-            try:
-                logger.info("MUSA available: %s", torch.musa.is_available())
-                logger.info("MUSA device count: %s", torch.musa.device_count())
-            except Exception:
-                pass
-    except ImportError as e:
-        logger.error("Failed to import torch: %s", e)
-        return False
-    return True
+    if hasattr(runtime, "head"):
+        payload["head"] = module_state_to_cpu(runtime.head)
+    if hasattr(runtime, "tp_heads"):
+        payload["tp_heads"] = [module_state_to_cpu(module) for module in runtime.tp_heads]
+    path = output_dir / f"{mode_name}_adapter_checkpoint.pt"
+    torch.save(payload, path)
+    return path
 
 
 def main() -> int:
     args = parse_args()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "training.log"
+
+    env = detect_backend()
     config = load_config(args.config_file)
+    texts = load_train_texts()
+    samples_path = ensure_runtime_samples(texts, output_dir)
 
-    logger.info("=" * 60)
-    logger.info("5.1.6 Training Task (MTT-TRAIN-RUN-TEST)")
-    logger.info("=" * 60)
+    max_steps = int(config.get("training_config", {}).get("max_steps", 6))
+    max_steps = max(2, min(max_steps, 2))
+    max_seq_len = int(config.get("data_config", {}).get("max_seq_len", 32))
+    max_seq_len = max(8, min(max_seq_len, 8))
+    lora_rank = int(config.get("lora_config", {}).get("lora_rank", 8))
+    microbatch_num = max(1, int(config.get("training_config", {}).get("gradient_accumulation_steps", 1)))
+    global_batch_size = microbatch_num
 
-    logger.info("[Step A] Checking environment...")
-    if not setup_environment():
-        return 2
+    device_ids = parse_device_ids(args.device_ids, args.num_gpus)
+    mode_name = "dual" if args.num_gpus >= 2 else "single"
+    pp_size = 2 if args.num_gpus >= 2 else 1
 
-    logger.info("[Step B] Preparing model and config...")
-    logger.info("Model path: %s", args.model_path)
-    logger.info("Task type: %s", args.task_type)
-    logger.info("Number of GPUs: %s", args.num_gpus)
-
-    if not os.path.exists(args.model_path):
-        logger.error("Model path not found: %s", args.model_path)
-        return 3
-
-    logger.info("[Step C-E] Running training probe...")
-    started = datetime.now(timezone.utc).isoformat()
-    result = run_single_or_dual(args, config)
-    finished = datetime.now(timezone.utc).isoformat()
-
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "task_id": "MTT-TRAIN-RUN-TEST",
-        "hostname": platform.node(),
-        "model_path": os.path.abspath(args.model_path),
-        "task_type": args.task_type,
+    summary: dict[str, Any] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode_name,
+        "success": False,
+        "dry_run": bool(args.dry_run),
         "num_gpus": args.num_gpus,
-        "distributed": args.distributed,
-        "dry_run": args.dry_run,
-        "training_mode": result.get("mode"),
-        "started_at": started,
-        "finished_at": finished,
-        "success": result.get("success", False),
-        "errors": result.get("errors", []),
-        "workers": result.get("workers", []),
+        "model_path": os.path.abspath(args.model_path),
+        "config_file": os.path.abspath(args.config_file),
+        "runtime_source": "clj-proj/train-infer-estimation-release-2026-04-11/mvp_llama_train_runtime.py",
+        "task_type": args.task_type,
+        "distributed": bool(args.distributed),
+        "backend": env["backend"],
+        "device_count": env["device_count"],
+        "device_names": env["device_names"],
+        "device_ids": device_ids,
+        "pipeline_parallel_size": pp_size,
+        "microbatch_num": microbatch_num,
+        "global_batch_size": global_batch_size,
+        "steps": max_steps,
+        "outputs": [str(log_path)],
+        "errors": [],
     }
-    metrics_file = write_training_metrics(args.output_dir, payload)
-    logger.info("Training metrics written: %s", metrics_file)
 
-    if payload["success"]:
-        logger.info("Test PASSED")
+    if args.dry_run:
+        log_path.write_text(
+            "dry-run: train-infer-estimation runtime path verified, no real model execution.\n",
+            encoding="utf-8",
+        )
+        summary["success"] = True
+        summary["timings_ms"] = []
+        summary["trainable_parameter_count"] = 0
+        (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         return 0
 
-    logger.error("Test FAILED")
-    return 4
+    if env["backend"] == "cpu":
+        summary["errors"].append("no_musa_or_cuda_backend")
+        log_path.write_text("No MUSA/CUDA backend available.\n", encoding="utf-8")
+        (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        return 1
+    if int(env["device_count"]) < args.num_gpus:
+        summary["errors"].append(f"insufficient_devices:{env['device_count']}<{args.num_gpus}")
+        log_path.write_text("Insufficient visible accelerator devices.\n", encoding="utf-8")
+        (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        return 1
+
+    started_at = time.perf_counter()
+    try:
+        runtime = LlamaTrainRuntime(
+            model_path=args.model_path,
+            samples_path=str(samples_path),
+            device_backend=env["backend"],
+            pipeline_parallel_size=pp_size,
+            tensor_parallel_size=1,
+            max_seq_len=max_seq_len,
+            split_index=16,
+            lora_rank=lora_rank,
+            adapter_only=False,
+        )
+        modules = trainable_modules(runtime)
+        timings_ms = []
+        parameter_norm_trace = []
+
+        for step in range(max_steps):
+            sync_ids = [0, 1] if pp_size > 1 else [0]
+            _synchronize(env["backend"], sync_ids)
+            started = time.perf_counter()
+            runtime.train_iteration(microbatch_num=microbatch_num, global_batch_size=global_batch_size)
+            _synchronize(env["backend"], sync_ids)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            timings_ms.append(elapsed_ms)
+            parameter_norm_trace.append(
+                {
+                    "step": step + 1,
+                    "elapsed_ms": elapsed_ms,
+                    "trainable_parameter_norm": parameter_norm(modules),
+                }
+            )
+
+        checkpoint_path = save_checkpoint(runtime, mode_name, output_dir)
+        execution_time_seconds = time.perf_counter() - started_at
+
+        log_lines = [
+            f"runtime_source={summary['runtime_source']}",
+            f"backend={env['backend']}",
+            f"mode={mode_name}",
+            f"pipeline_parallel_size={pp_size}",
+            f"steps={max_steps}",
+            f"timings_ms={timings_ms}",
+            f"checkpoint={checkpoint_path}",
+        ]
+        log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
+        summary.update(
+            {
+                "success": True,
+                "timings_ms": timings_ms,
+                "avg_step_ms": sum(timings_ms) / len(timings_ms),
+                "execution_time_seconds": execution_time_seconds,
+                "checkpoint_path": str(checkpoint_path),
+                "parameter_norm_trace": parameter_norm_trace,
+                "trainable_parameter_count": int(
+                    sum(param.numel() for module in modules for param in module.parameters())
+                ),
+                "outputs": [str(log_path), str(checkpoint_path), str(samples_path)],
+            }
+        )
+    except Exception as exc:
+        log_path.write_text(f"runtime_error={repr(exc)}\n", encoding="utf-8")
+        summary["errors"].append(repr(exc))
+        summary["execution_time_seconds"] = time.perf_counter() - started_at
+        (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        return 1
+
+    (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0
 
 
 if __name__ == "__main__":

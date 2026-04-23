@@ -22,6 +22,8 @@ def dump_json(path, payload):
 def build_model():
     task = load_json(os.path.join(ROOT, "training_task_config.json"))
     mapping = load_json(os.path.join(ROOT, "resource_mapping.json"))
+    runtime_observation_path = os.path.join(ARTIFACT, "runtime_observation.json")
+    runtime_observation = load_json(runtime_observation_path) if os.path.exists(runtime_observation_path) else None
     tensor_parallel_size = int(task["parallelism"]["tensor_parallel_size"])
     tensor_parallel_enabled = tensor_parallel_size > 1
 
@@ -124,8 +126,9 @@ def build_model():
             "microbatch_logic_present": True,
             "dag_present": True,
             "consistency_check": "pass",
-            "runtime_execution_verified": False
-        }
+            "runtime_execution_verified": bool(runtime_observation and runtime_observation.get("success"))
+        },
+        "runtime_observation": runtime_observation,
     }
     return execution_model
 

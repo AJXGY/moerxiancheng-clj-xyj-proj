@@ -77,6 +77,7 @@ def build_inputs(tokenizer, prompt, device):
 
 def real_infer(tokenizer, model, device, prompt, max_new_tokens):
     import torch
+    import time
 
     inputs = build_inputs(tokenizer, prompt, device)
     input_len = inputs["input_ids"].shape[-1]
@@ -89,6 +90,23 @@ def real_infer(tokenizer, model, device, prompt, max_new_tokens):
         eot_id = None
     if isinstance(eot_id, int) and eot_id >= 0 and eot_id not in eos_token_ids:
         eos_token_ids.append(eot_id)
+
+    # Device sync before timing to flush prior async ops
+    try:
+        if hasattr(torch, "musa") and getattr(torch, "musa") is not None:
+            try:
+                torch.musa.synchronize()
+            except Exception:
+                pass
+        elif torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    t0 = time.perf_counter()
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
@@ -98,9 +116,28 @@ def real_infer(tokenizer, model, device, prompt, max_new_tokens):
             pad_token_id=tokenizer.eos_token_id,
             use_cache=True,
         )
+
+    # Device sync after generation to ensure accurate timing
+    try:
+        if hasattr(torch, "musa") and getattr(torch, "musa") is not None:
+            try:
+                torch.musa.synchronize()
+            except Exception:
+                pass
+        elif torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    t1 = time.perf_counter()
+    elapsed_ms = (t1 - t0) * 1000.0
+
     generated_ids = output_ids[0][input_len:]
     decoded = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-    return decoded
+    return decoded, elapsed_ms
 
 
 def dry_infer(item, mode_name, device_label):
@@ -152,6 +189,7 @@ def worker_main(worker_id, prompts, args, queue):
     results = []
     errors = []
     started_at = datetime.now(timezone.utc).isoformat()
+    model_load_ms = None
     try:
         use_real = (
             not args.dry_run
@@ -160,10 +198,14 @@ def worker_main(worker_id, prompts, args, queue):
         )
         tokenizer = model = device = None
         if use_real:
+            import time as _time
+            load_start = _time.perf_counter()
             tokenizer, model, device = load_model_bundle(args.model_path, backend, device_id)
+            load_end = _time.perf_counter()
+            model_load_ms = (load_end - load_start) * 1000.0
         for item in prompts:
             if use_real:
-                raw_text = real_infer(
+                raw_text, gen_ms = real_infer(
                     tokenizer=tokenizer,
                     model=model,
                     device=device,
@@ -185,6 +227,7 @@ def worker_main(worker_id, prompts, args, queue):
                     "worker_id": worker_id,
                     "device": device_label,
                     "success": True,
+                    "gen_ms": gen_ms if use_real else None,
                 }
             )
     except Exception as exc:
@@ -197,16 +240,17 @@ def worker_main(worker_id, prompts, args, queue):
             }
         )
 
-    queue.put(
-        {
-            "worker_id": worker_id,
-            "device": device_label,
-            "started_at": started_at,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "results": results,
-            "errors": errors,
-        }
-    )
+    payload = {
+        "worker_id": worker_id,
+        "device": device_label,
+        "started_at": started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "results": results,
+        "errors": errors,
+    }
+    if use_real:
+        payload["model_load_ms"] = model_load_ms
+    queue.put(payload)
 
 
 def chunk_prompts(prompts, parts):

@@ -11,6 +11,7 @@ SINGLE_DEVICE_IDS="0"
 DUAL_DEVICE_IDS="0,1"
 DRY_RUN="false"
 SKIP_MODEL_BUILD="false"
+SINGLE_ONLY="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +39,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_MODEL_BUILD="true"
       shift
       ;;
+    --single-only)
+      SINGLE_ONLY="true"
+      shift
+      ;;
     *)
       echo "Unknown arg: $1" >&2
       exit 1
@@ -63,6 +68,9 @@ fi
 if [[ "${SKIP_MODEL_BUILD}" == "true" ]]; then
   RUN_512_ARGS+=(--skip-model-build)
 fi
+if [[ "${SINGLE_ONLY}" == "true" ]]; then
+  RUN_512_ARGS+=(--single-only)
+fi
 
 bash "${RUN_512_REAL}" "${RUN_512_ARGS[@]}" | tee "${LOG_FILE}"
 
@@ -87,7 +95,7 @@ cp -rf "${SOURCE_ARTIFACT}" "${TARGET_ARTIFACT}/runtime_bundle"
 cp -f "${SOURCE_REPORT}" "${TARGET_ARTIFACT}/5.1.12实测结果.md"
 
 echo "[3/4] 生成 5.2.15 摘要报告..."
-python3 - <<'PY' "${TARGET_ARTIFACT}" "${SOURCE_ARTIFACT}" "${SOURCE_REPORT}" "${MODEL_PATH}" "${DEVICE_TYPE}" "${SINGLE_DEVICE_IDS}" "${DUAL_DEVICE_IDS}" "${DRY_RUN}"
+python3 - <<'PY' "${TARGET_ARTIFACT}" "${SOURCE_ARTIFACT}" "${SOURCE_REPORT}" "${MODEL_PATH}" "${DEVICE_TYPE}" "${SINGLE_DEVICE_IDS}" "${DUAL_DEVICE_IDS}" "${DRY_RUN}" "${SINGLE_ONLY}"
 import json
 import os
 import sys
@@ -101,6 +109,7 @@ device_type = sys.argv[5]
 single_ids = sys.argv[6]
 dual_ids = sys.argv[7]
 dry_run = sys.argv[8] == "true"
+single_only = sys.argv[9] == "true"
 
 runtime_summary_path = os.path.join(source_artifact, "runtime_validation_summary.json")
 overall_pass = False
@@ -112,7 +121,7 @@ if os.path.exists(runtime_summary_path):
         rs = json.load(f)
     overall_pass = bool(rs.get("overall_pass", False))
     single_success = bool(rs.get("single_success", False))
-    dual_success = bool(rs.get("dual_success", False))
+  dual_success = bool(rs.get("dual_success", False)) if not single_only else None
 
 payload = {
     "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -125,9 +134,10 @@ payload = {
     "single_device_ids": single_ids,
     "dual_device_ids": dual_ids,
     "dry_run": dry_run,
+    "single_only": single_only,
     "single_success": single_success,
     "dual_success": dual_success,
-    "overall_pass": overall_pass,
+    "overall_pass": overall_pass if not single_only else single_success,
 }
 
 summary_json = os.path.join(target_artifact, "runtime_validation_summary.json")
@@ -135,6 +145,8 @@ with open(summary_json, "w", encoding="utf-8") as f:
     json.dump(payload, f, ensure_ascii=False, indent=2)
 
 status = "通过" if overall_pass else "未通过"
+if single_only:
+  status = "通过" if single_success else "未通过"
 report_md = f"""# 5.2.15 实测结果
 
 - 生成时间：{payload['generated_at']}
@@ -145,6 +157,7 @@ report_md = f"""# 5.2.15 实测结果
 - 单卡设备：{single_ids}
 - 双卡设备：{dual_ids}
 - dry-run：{str(dry_run).lower()}
+- single-only：{str(single_only).lower()}
 
 ## 判定结果
 
@@ -162,6 +175,8 @@ report_md = f"""# 5.2.15 实测结果
 - runtime_bundle/runtime_dual/summary.json
 - runtime_bundle/5.1.12实测结果.md
 """
+if single_only:
+  report_md = report_md.replace("- runtime_bundle/runtime_dual/summary.json\n", "")
 
 report_out = os.path.join(target_artifact, "5.2.15实测结果.md")
 with open(report_out, "w", encoding="utf-8") as f:

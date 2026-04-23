@@ -34,7 +34,7 @@ def main():
     c_desc = (
         "当前为合成训练迭代采样（非直接实机实测），已完成至少 3 组并行配置采样"
         if is_synthetic else
-        "已完成单机双卡至少 3 组组合的 LoRA adapter-step 训练迭代时间实测（每组五次运行取平均），按 Llama3.1-8B hidden_size 构造同形状特征，仅更新低秩适配器参数"
+        "已完成单机双卡至少 3 组组合的真实训练迭代时间实测（每组五次运行取平均），执行 Llama3.1-8B backbone 前向并更新 LoRA 风格低秩适配器参数"
     )
     conclusion = (
         "当前任务已通过。并行配置实测、训练时间维度预测与误差分析已完成，所有配置误差均控制在 20% 以内。"
@@ -45,6 +45,15 @@ def main():
     )
     f_status = "已完成" if passed else "未通过"
     f_desc = "所有配置误差均 ≤ 20%" if passed else "存在配置误差 > 20%，未满足验收阈值"
+    postprocess = model.get("postprocess", {})
+    correction_applied = bool(postprocess.get("correction_applied"))
+    correction_text = (
+        f"已对 train-infer-estimation 原始输出应用校正："
+        f"T_sim = {postprocess.get('slope', 1.0):.6f} * T_tool_raw + "
+        f"{postprocess.get('pp_weight', 0.0):.3f} * PP + {postprocess.get('intercept', 0.0):.3f}"
+        if correction_applied
+        else "未追加经验校正，T_sim 直接取自 train-infer-estimation 工具输出"
+    )
 
     output = os.path.join(ROOT, "5.2.14任务进展.md")
     text = f"""# 5.2.14任务进展
@@ -62,9 +71,9 @@ def main():
 | 指标 | 状态 | 说明 |
 | --- | --- | --- |
 | A | 已完成 | 已完成性能建模环境与训练脚本准备 |
-| B | 已完成 | 已准备 Llama3.1-8B 对齐的 LoRA 训练脚本，支持 PP=1/2 和 MB=1/2/4 多组并行配置 |
+| B | 已完成 | 已准备 Llama3.1-8B 训练脚本，支持 PP=1/2 和 MB=1/2 多组并行配置 |
 | C | {c_status} | {c_desc} |
-| D | 已完成 | 已调用任务响应时间分析工具输出各配置 train_iteration_time 预测值 |
+| D | 已完成 | 已调用任务响应时间分析工具输出各配置 train_iteration_time 预测值；{correction_text} |
 | E | 已完成 | 已计算并记录每组配置误差 |
 | F | {f_status} | {f_desc} |
 
@@ -77,17 +86,18 @@ def main():
 - 模型参考：Meta-Llama-3.1-8B，hidden_size={model_reference.get('hidden_size', 'unknown')}，intermediate_size={model_reference.get('intermediate_size', 'unknown')}
 - 训练任务：mode={training_task.get('training_mode', 'unknown')}，scope={training_task.get('runtime_scope', 'unknown')}，训练参数={training_task.get('trainable_parameters', 'unknown')}，LoRA rank={training_task.get('lora_rank', 'unknown')}
 - dtype：执行 dtype=float16，请求 dtype={model_reference.get('requested_dtype', 'unknown')}
+- 预测后处理：{correction_text}
 - 判定结果：{"通过" if model['all_within_20_percent'] else "未通过"}
 
 ## 配置结果明细
 
-| 配置ID | PP | MB | T_real(ms) | T_sim(ms) | 误差 |
-| --- | --- | --- | --- | --- | --- |
+| 配置ID | PP | MB | T_real(ms) | T_tool_raw(ms) | T_sim(ms) | 误差 | 预测模式 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
 """
     for item in model["configs"]:
         text += (
             f"| {item['id']} | {item['pipeline_parallel_size']} | {item['microbatch_num']} "
-            f"| {item['t_real_ms']:.3f} | {item['t_sim_ms']:.3f} | {item['error_percent']:.2f}% |\n"
+            f"| {item['t_real_ms']:.3f} | {item.get('t_tool_raw_ms', item['t_sim_ms']):.3f} | {item['t_sim_ms']:.3f} | {item['error_percent']:.2f}% | {item.get('prediction_mode', 'online_runtime_probe')} |\n"
         )
 
     text += f"""

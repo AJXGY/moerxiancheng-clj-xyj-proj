@@ -58,7 +58,7 @@ def classify(preflight, single, dual):
     # Step B: 模型和配置准备
     if model_exists and single_visible:
         b_status = "已完成"
-        b_detail = "模型存在，且检查到单卡资源可见"
+        b_detail = "模型存在，且检查到单卡资源可见；训练执行方法统一切换为 train-infer-estimation runtime"
     elif model_exists:
         b_status = "部分完成"
         b_detail = "模型已就绪，但当前环境未验证到摩尔线程单卡资源可见"
@@ -70,7 +70,7 @@ def classify(preflight, single, dual):
     # Step C: 训练任务启动与执行
     if single_ok and dual_ok and not used_dry_run and single_visible and dual_visible:
         c_status = "已完成"
-        c_detail = "单卡与双卡训练任务均执行成功"
+        c_detail = "单卡与双卡训练任务均执行成功，且均由 train-infer-estimation 训练 runtime 驱动"
     elif single_ok and dual_ok and used_dry_run:
         c_status = "部分完成"
         c_detail = "单卡与双卡流程已通过 dry-run 验证，待摩尔线程实机补做真实训练"
@@ -108,13 +108,13 @@ def classify(preflight, single, dual):
     statuses.append((
         "E",
         "已完成" if outputs_ready and not used_dry_run else "部分完成" if (single or dual) else "未完成",
-        "已记录任务结束状态并输出真实训练结果" if outputs_ready and not used_dry_run else "已生成流程验证输出，待补齐真实训练结果" if (single or dual) else "缺少训练输出"
+        "已记录任务结束状态并输出真实训练结果与 checkpoint" if outputs_ready and not used_dry_run else "已生成流程验证输出，待补齐真实训练结果" if (single or dual) else "缺少训练输出"
     ))
     
     # Step F: 测试判定
     if single_ok and dual_ok and package_ready and single_visible and dual_visible and error_free_single and error_free_dual:
         f_status = "已完成"
-        f_detail = "满足任务成功完成且结果正确的判定条件"
+        f_detail = "满足任务成功完成且结果正确的判定条件，当前口径为 train-infer-estimation runtime 实跑"
     elif single_ok and dual_ok and not used_dry_run:
         f_status = "部分完成"
         f_detail = "流程已跑通，但当前机器不是目标摩尔线程实机环境，需补最终适配性验证"
@@ -174,6 +174,10 @@ def build_markdown(output_path, preflight, single, dual):
         md.append(f"- **执行状态**：{'成功' if single.get('success') else '失败'}\n")
         md.append(f"- **Dry-run模式**：{single.get('dry_run', False)}\n")
         md.append(f"- **执行时间**：{single.get('execution_time_seconds', 'N/A')}秒\n")
+        if single.get("avg_step_ms") is not None:
+            md.append(f"- **平均每 step 时间**：{single.get('avg_step_ms'):.3f} ms\n")
+        if single.get("runtime_source"):
+            md.append(f"- **训练方法来源**：`{single.get('runtime_source')}`\n")
         md.append(f"- **输出数量**：{len(single.get('outputs', []))}\n")
         if single.get("errors"):
             md.append(f"- **错误信息**：\n")
@@ -187,6 +191,10 @@ def build_markdown(output_path, preflight, single, dual):
         md.append(f"- **执行状态**：{'成功' if dual.get('success') else '失败'}\n")
         md.append(f"- **Dry-run模式**：{dual.get('dry_run', False)}\n")
         md.append(f"- **执行时间**：{dual.get('execution_time_seconds', 'N/A')}秒\n")
+        if dual.get("avg_step_ms") is not None:
+            md.append(f"- **平均每 step 时间**：{dual.get('avg_step_ms'):.3f} ms\n")
+        if dual.get("runtime_source"):
+            md.append(f"- **训练方法来源**：`{dual.get('runtime_source')}`\n")
         md.append(f"- **输出数量**：{len(dual.get('outputs', []))}\n")
         if dual.get("errors"):
             md.append(f"- **错误信息**：\n")

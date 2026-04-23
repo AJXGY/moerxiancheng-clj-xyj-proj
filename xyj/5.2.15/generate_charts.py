@@ -113,17 +113,22 @@ def draw_runtime(model):
 def draw_model(model):
     img, draw = canvas("推理任务时间维度模型参数")
     alpha = model["model"]["alpha_ms"]
-    beta = model["model"]["beta_ms_per_pp"]
     gamma = model["model"]["gamma_ms"]
+    beta = model["model"].get("beta_ms_per_pp")
+    single_only = bool(model["model"].get("single_only", False))
 
     draw.rounded_rectangle((160, 230, 1120, 560), radius=26, fill="#dbeafe", outline="#60a5fa", width=4)
     draw.text((210, 300), "模型公式", fill="#1d4ed8", font=font(40, True))
-    draw.text((210, 380), "T_sim = alpha + beta * PP + gamma * (1/MB)", fill="#0f172a", font=font(34))
+    formula = "T_sim = alpha + gamma * (1/MB)" if single_only else "T_sim = alpha + beta * PP + gamma * (1/MB)"
+    draw.text((210, 380), formula, fill="#0f172a", font=font(34))
 
     draw.rounded_rectangle((1220, 230, 2020, 620), radius=26, fill="#dcfce7", outline="#4ade80", width=4)
     draw.text((1260, 300), f"alpha = {alpha:.6f} ms", fill="#166534", font=font(33, True))
-    draw.text((1260, 390), f"beta = {beta:.6f} ms/pp", fill="#166534", font=font(31))
-    draw.text((1260, 480), f"gamma = {gamma:.6f} ms", fill="#166534", font=font(31))
+    if beta is not None:
+        draw.text((1260, 390), f"beta = {beta:.6f} ms/pp", fill="#166534", font=font(31))
+        draw.text((1260, 480), f"gamma = {gamma:.6f} ms", fill="#166534", font=font(31))
+    else:
+        draw.text((1260, 390), f"gamma = {gamma:.6f} ms", fill="#166534", font=font(31))
 
     draw.text((180, 760), "PP: 流水线并行路数, MB: 微批次数", fill="#334155", font=font(30))
     save(img, os.path.join(CHART_DIR, "time_model.png"))

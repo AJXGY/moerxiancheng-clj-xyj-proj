@@ -17,6 +17,13 @@ cd /home/o_mabin/moerxiancheng-clj-xyj-proj/xyj/5.2.15
 bash run_5215_suite.sh
 ```
 
+单卡稳定测量模式：
+
+```bash
+cd /home/o_mabin/moerxiancheng-clj-xyj-proj/xyj/5.2.15
+bash run_5215_suite.sh --single-only
+```
+
 ## 一键实测
 
 如需进行真实推理运行采集并把证据归档到 5.2.15：
@@ -28,6 +35,18 @@ bash run_5215_real_suite.sh \
 	--device-type musa \
 	--single-device-ids 0 \
 	--dual-device-ids 0,1
+```
+
+单卡实测模式：
+
+```bash
+cd /home/o_mabin/moerxiancheng-clj-xyj-proj/xyj/5.2.15
+bash run_5215_real_suite.sh \
+	--model-path /home/o_mabin/moerxiancheng-clj-xyj-proj/clj-proj/model/Meta-Llama-3.1-8B \
+	--device-type musa \
+	--single-device-ids 0 \
+	--dual-device-ids 0,1 \
+	--single-only
 ```
 
 可选参数：

@@ -29,6 +29,7 @@ def load_validation():
 def main():
     model = load_json(os.path.join(ARTIFACT, "training_execution_model.json"))
     validation = load_validation()
+    runtime_observation = model.get("runtime_observation")
     output = os.path.join(ROOT, "5.1.11任务进展.md")
     passed_checks = sum(1 for item in validation["checks"] if item["passed"])
     total_checks = len(validation["checks"])
@@ -44,7 +45,7 @@ def main():
 
 ## 当前结论
 
-本次已完成训练任务处理模型输出验证。通过输入 Llama3.1-8B 训练任务配置与资源映射策略，建模脚本成功生成了完整执行模型，覆盖 CPU/GPU 任务分配、多卡划分、并行方式、Microbatch 执行逻辑和 DAG 依赖图，可作为 5.1.11 测试记录提交。这里的摩尔线程 GPU 结论仅指资源映射建模成立，不代表真实 `torch_musa` 训练 runtime 已在本目录完成验证。
+本次已完成训练任务处理模型输出验证。通过输入 Llama3.1-8B 训练任务配置与资源映射策略，建模脚本成功生成了完整执行模型，覆盖 CPU/GPU 任务分配、多卡划分、并行方式、Microbatch 执行逻辑和 DAG 依赖图；同时额外执行了 1 次真实 `torch_musa` 双卡训练观测，用于校对建模结果与实际运行逻辑的一致性。
 
 ## A-H 指标完成情况
 
@@ -63,6 +64,7 @@ def main():
 
 - 执行模型：[training_execution_model.json]({ARTIFACT}/training_execution_model.json)
 - 核验报告：[validation_report.json]({ARTIFACT}/validation_report.json)
+- 运行观测：[runtime_observation.json]({ARTIFACT}/runtime_observation.json)
 - 图表总览：[5.1.11图表汇总.md]({ROOT}/5.1.11图表汇总.md)
 - DAG 图：[dag_graph.svg]({ROOT}/charts/dag_graph.svg)
 - 并行划分图：[pipeline_parallelism.svg]({ROOT}/charts/pipeline_parallelism.svg)
@@ -89,17 +91,19 @@ def main():
   - `musa:1` -> {model["partitioning"]["pipeline_stages"][1]["layers"]}
 - 结构一致性核验：{passed_checks}/{total_checks} 项通过
 - 一致性检查：{"pass" if validation["all_passed"] else "needs review"}
+- 运行观测：{"success" if runtime_observation and runtime_observation.get("success") else "not verified"}
 
 ## 复线说明
 
-- 本任务是“训练任务处理模型输出测试”，核心在于建模输出是否完整，不要求真实训练作业落到 GPU 上执行。
-- 当前目录不会导入 `torch_musa` 或启动真实训练进程，因此不能据此认定摩尔线程训练链路已经在 5.1.11 内跑通。
-- 复线时只需保证配置文件、资源映射和建模脚本一致，即可重现同类结构化产物与图表。
+- 本任务仍然是“训练任务处理模型输出测试”，核心验收点是结构模型是否完整。
+- 当前目录已补充 1 次真实 `torch_musa` 双卡训练观测，用来验证建模结果没有明显背离真实训练链路，但它不是 5.1.6 那种完整训练运行测试替代品。
+- 复线时建议先跑 runtime 观测，再生成结构模型与核验报告。
 
 ## 如何复线
 
 ```bash
 cd /home/o_mabin/moerxiancheng-clj-xyj-proj/clj-proj/5.1.11
+python3 capture_runtime_observation.py
 python3 build_training_model.py
 python3 verify_training_model.py
 python3 generate_charts.py

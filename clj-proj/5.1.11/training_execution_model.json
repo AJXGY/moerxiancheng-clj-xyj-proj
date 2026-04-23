@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-19T17:41:36.253557+00:00",
+  "generated_at": "2026-04-23T15:21:10.916050+00:00",
   "task_id": "MTT-TRAIN-MODEL-STRUCT-TEST",
   "task_name": "llama3.1_8b_lora_training",
   "model_name": "Meta-Llama-3.1-8B",
@@ -211,6 +211,26 @@
     "microbatch_logic_present": true,
     "dag_present": true,
     "consistency_check": "pass",
-    "runtime_execution_verified": false
+    "runtime_execution_verified": true
+  },
+  "runtime_observation": {
+    "generated_at": "2026-04-23T15:20:21.633386+00:00",
+    "task_id": "MTT-TRAIN-MODEL-STRUCT-TEST",
+    "mode": "runtime_consistency_probe",
+    "backend": "musa",
+    "device_count": 2,
+    "device_names": [
+      "MTT S3000",
+      "MTT S3000"
+    ],
+    "pipeline_parallel_size": 2,
+    "tensor_parallel_size": 1,
+    "microbatch_num": 1,
+    "global_batch_size": 1,
+    "split_index": 16,
+    "model_path": "/home/o_mabin/moerxiancheng-clj-xyj-proj/clj-proj/model/Meta-Llama-3.1-8B",
+    "samples_path": "/home/o_mabin/moerxiancheng-clj-xyj-proj/clj-proj/5.1.6/train_samples.jsonl",
+    "success": true,
+    "elapsed_ms": 39629.79478109628
   }
 }
