@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from mvp_estimator import collective_bandwidth_gbps, collective_latency_ms
-from mvp_llama_train_runtime import benchmark_llama_backbone_probe
+from mvp_llama_train_runtime import LoraFeatureTrainRuntime, benchmark_runtime, benchmark_llama_backbone_probe
 from mvp_types import ExecutionConfig, HardwareCalibration
 
 
@@ -175,6 +175,24 @@ def benchmark_train_microbatch_ms(
             warmups=1,
             max_seq_len=int(model_desc.get("max_seq_len", 8)),
             split_index=int(model_desc.get("pipeline_split_index", 16)),
+            lora_rank=int(model_desc.get("lora_rank", 8)),
+            adapter_only=bool(model_desc.get("adapter_only", False)),
+        )
+    if model_desc.get("train_workload") == "lora_feature_probe":
+        runtime = LoraFeatureTrainRuntime(
+            hidden_size=int(model_desc.get("hidden_size", 4096)),
+            num_labels=int(model_desc.get("num_labels", 2)),
+            device_backend=device_backend,
+            pipeline_parallel_size=int(parallel_cfg.get("pipeline_parallel_size", 1)),
+            tensor_parallel_size=int(parallel_cfg.get("tensor_parallel_size", 1)),
+            lora_rank=int(model_desc.get("lora_rank", 8)),
+        )
+        return benchmark_runtime(
+            runtime,
+            microbatch_num=int(parallel_cfg.get("microbatch_num", 1)),
+            global_batch_size=int(parallel_cfg.get("global_batch_size", 8)),
+            runs=runs,
+            warmups=1,
         )
 
     pp_size = int(parallel_cfg.get("pipeline_parallel_size", 1))

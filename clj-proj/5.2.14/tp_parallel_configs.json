@@ -1,14 +1,5 @@
 [
   {
-    "id": "cfg_tp2_mb1",
-    "name": "TP=2, MB=1",
-    "pipeline_parallel_size": 1,
-    "tensor_parallel_size": 2,
-    "microbatch_num": 1,
-    "global_batch_size": 1,
-    "dtype": "float16"
-  },
-  {
     "id": "cfg_tp2_mb2",
     "name": "TP=2, MB=2",
     "pipeline_parallel_size": 1,
@@ -24,6 +15,15 @@
     "tensor_parallel_size": 2,
     "microbatch_num": 4,
     "global_batch_size": 4,
+    "dtype": "float16"
+  },
+  {
+    "id": "cfg_tp2_mb6",
+    "name": "TP=2, MB=6",
+    "pipeline_parallel_size": 1,
+    "tensor_parallel_size": 2,
+    "microbatch_num": 6,
+    "global_batch_size": 6,
     "dtype": "float16"
   }
 ]

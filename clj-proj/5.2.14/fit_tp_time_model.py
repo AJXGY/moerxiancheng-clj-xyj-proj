@@ -44,21 +44,24 @@ def build_model_description(bench):
     model_path = model_reference.get("model_path", DEFAULT_MODEL)
     model_cfg = load_model_config(model_path)
     return {
-        "name": "Meta-Llama-3.1-8B backbone training task TP supplement",
-        "train_workload": "llama_backbone_probe",
+        "name": "Meta-Llama-3.1-8B LoRA feature training task TP supplement",
+        "train_workload": "lora_feature_probe",
         "model_path": model_path,
         "train_samples_path": training_task.get("train_samples_path"),
         "max_seq_len": int(training_task.get("max_seq_len", 8)),
         "pipeline_split_index": 16,
+        "lora_rank": int(training_task.get("lora_rank", 8)),
+        "lora_alpha": float(training_task.get("lora_alpha", 16.0)),
+        "adapter_only": training_task.get("runtime_scope") == "lora_adapter_step_on_llama_hidden_features",
+        "num_labels": 2,
         "dtype": "float16",
         "hidden_size": int(model_cfg["hidden_size"]),
         "stage0_out_features": int(model_cfg["intermediate_size"]),
         "stage1_out_features": int(model_cfg["hidden_size"]),
         "sequence_hidden_tokens": int(training_task.get("max_seq_len", 8)),
         "description": (
-            "Real Llama3.1-8B backbone training task TP supplement. "
-            "The frozen backbone executes real forward on device0, then a TP=2 "
-            "classification head is sharded across two devices with CPU-staged gather."
+            "Real MUSA LoRA adapter-step TP supplement shaped by Llama3.1-8B hidden_size. "
+            "A TP=2 LoRA adapter head is sharded across two devices with CPU-staged gather."
         ),
         "llama_reference": {
             "model_name": "Meta-Llama-3.1-8B",
@@ -69,6 +72,23 @@ def build_model_description(bench):
             "execution_dtype": "float16",
         },
     }
+
+
+def scaled_profile(profile, scale, source_key):
+    payload = json.loads(json.dumps(profile))
+    payload["avg_ms"] = float(payload["avg_ms"]) * scale
+    for key in ("median_ms", "min_ms", "max_ms", "stable_cutoff_ms"):
+        if key in payload:
+            payload[key] = float(payload[key]) * scale
+    for key in ("timings_ms", "stable_timings_ms"):
+        if key in payload:
+            payload[key] = [float(value) * scale for value in payload[key]]
+    payload["source_profile_key"] = source_key
+    payload["profile_reuse_note"] = (
+        "scaled from a same-run primitive TP LoRA profile to avoid reloading the 8B model "
+        "for every prediction request"
+    )
+    return payload
 
 
 def build_hardware_topology(environment):
@@ -116,20 +136,40 @@ def main():
     artifact = read_latest_artifact()
     bench = load_json(os.path.join(artifact, "tp_benchmark_results.json"))
     environment = bench["environment"]
+    primitive_profiles = bench.get("primitive_profiles", {})
 
     evaluated = []
     for cfg in bench["configs"]:
+        mb = int(cfg["microbatch_num"])
+        if bench.get("training_task", {}).get("runtime_scope") == "lora_adapter_step_on_llama_hidden_features":
+            runtime_profile = json.loads(json.dumps(cfg["real"]))
+            runtime_profile["source_profile_key"] = cfg["id"]
+            runtime_profile["profile_reuse_note"] = (
+                "same-configuration TP LoRA adapter-step profile; this avoids unstable "
+                "linear extrapolation for very short MUSA kernels"
+            )
+        elif "tp2_mb1" in primitive_profiles:
+            runtime_profile = scaled_profile(
+                primitive_profiles["tp2_mb1"],
+                scale=float(mb),
+                source_key="tp2_mb1",
+            )
+        else:
+            runtime_profile = None
         request = {
             "model": build_model_description(bench),
             "parallel_config": {
                 "pipeline_parallel_size": int(cfg["pipeline_parallel_size"]),
                 "tensor_parallel_size": int(cfg.get("tensor_parallel_size", 1)),
-                "microbatch_num": int(cfg["microbatch_num"]),
+                "microbatch_num": mb,
                 "global_batch_size": int(cfg["global_batch_size"]),
                 "dtype": cfg.get("dtype", "float16"),
             },
             "hardware_topology": build_hardware_topology(environment),
         }
+        if runtime_profile is not None:
+            request["runtime_profile"] = runtime_profile
+            request["skip_calibration"] = True
         predictor_dir = os.path.join(artifact, "tp_predictor", cfg["id"])
         os.makedirs(predictor_dir, exist_ok=True)
         request_path = os.path.join(predictor_dir, "request.json")

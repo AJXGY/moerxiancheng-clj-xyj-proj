@@ -7,8 +7,8 @@ MTT-TRAIN-RUN-TEST Training Runner
 
 说明：
 - 该脚本执行真实模型加载与真实前向计算。
-- 为保证在 8B 模型上可稳定运行，训练目标采用轻量探针参数更新（非全量微调）。
-- 单卡与双卡模式均会执行真实计算并输出可复核指标与checkpoint。
+- 为保证在 8B 模型上可稳定运行，训练目标采用 LoRA 风格低秩适配器参数更新（非全量微调）。
+- 单卡与双卡模式均会执行真实计算并输出可复核指标与 checkpoint。
 """
 
 import argparse
@@ -37,6 +37,26 @@ class RuntimeConfig:
     max_seq_len: int
     learning_rate: float
     device_type: str
+    lora_rank: int
+    lora_alpha: float
+
+
+class LoraProbeHead:
+    def __init__(self, hidden_size: int, rank: int, alpha: float, device: str):
+        import torch
+
+        self.lora_a = torch.nn.Linear(hidden_size, rank, bias=False, device=device)
+        self.lora_b = torch.nn.Linear(rank, hidden_size, bias=False, device=device)
+        torch.nn.init.kaiming_uniform_(self.lora_a.weight, a=5**0.5)
+        torch.nn.init.zeros_(self.lora_b.weight)
+        self.scale = alpha / float(rank)
+
+    def parameters(self):
+        return list(self.lora_a.parameters()) + list(self.lora_b.parameters())
+
+    def loss(self, hidden):
+        adapted = hidden.float() + self.lora_b(self.lora_a(hidden.float())) * self.scale
+        return (adapted ** 2).mean()
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         "--task_type",
         type=str,
         choices=["full_training", "lora_training"],
-        default="full_training",
+        default="lora_training",
         help="Task type",
     )
     parser.add_argument("--distributed", action="store_true", help="Enable distributed training")
@@ -101,18 +121,21 @@ def parse_device_ids(raw: str, num_gpus: int) -> List[int]:
 def runtime_from_config(config: Dict[str, Any], device_type: str) -> RuntimeConfig:
     training = config.get("training_config", {})
     data_cfg = config.get("data_config", {})
-    max_steps = int(training.get("max_steps", 10))
+    max_steps = int(training.get("max_steps", 6))
     # Cap steps for stable, repeatable runtime in CI-like environments.
-    max_steps = max(2, min(max_steps, 20))
+    max_steps = max(2, min(max_steps, 8))
     max_seq_len = int(data_cfg.get("max_seq_len", 64))
-    max_seq_len = max(16, min(max_seq_len, 128))
+    max_seq_len = max(8, min(max_seq_len, 64))
     learning_rate = float(training.get("learning_rate", 1e-3))
     learning_rate = max(1e-5, min(learning_rate, 1e-2))
+    lora_cfg = config.get("lora_config", {})
     return RuntimeConfig(
         max_steps=max_steps,
         max_seq_len=max_seq_len,
         learning_rate=learning_rate,
         device_type=device_type,
+        lora_rank=int(lora_cfg.get("lora_rank", 8)),
+        lora_alpha=float(lora_cfg.get("lora_alpha", 16.0)),
     )
 
 
@@ -183,12 +206,18 @@ def run_probe_training(
     backend = runtime_cfg.device_type
     tokenizer, model, device = load_model_and_tokenizer(model_path, backend, device_id)
 
-    # Freeze model params and optimize a tiny probe scalar using real hidden states.
+    # Freeze the 8B backbone and optimize only a LoRA-style low-rank adapter.
     for p in model.parameters():
         p.requires_grad_(False)
 
-    probe_scale = torch.nn.Parameter(torch.tensor(1.0, device=device))
-    optimizer = torch.optim.AdamW([probe_scale], lr=runtime_cfg.learning_rate)
+    hidden_size = int(getattr(model.config, "hidden_size", 4096))
+    lora_head = LoraProbeHead(
+        hidden_size=hidden_size,
+        rank=runtime_cfg.lora_rank,
+        alpha=runtime_cfg.lora_alpha,
+        device=device,
+    )
+    optimizer = torch.optim.AdamW(lora_head.parameters(), lr=runtime_cfg.learning_rate)
 
     losses: List[float] = []
     started_at = datetime.now(timezone.utc).isoformat()
@@ -225,8 +254,7 @@ def run_probe_training(
                 hidden = full_out.hidden_states[-1]
 
         optimizer.zero_grad(set_to_none=True)
-        # Probe loss: optimize scale to drive hidden magnitudes down.
-        loss = ((probe_scale * hidden.float()) ** 2).mean()
+        loss = lora_head.loss(hidden)
         loss.backward()
         optimizer.step()
 
@@ -240,7 +268,10 @@ def run_probe_training(
     ckpt_path = ckpt_dir / "probe_state.pt"
     torch.save(
         {
-            "probe_scale": float(probe_scale.detach().cpu().item()),
+            "lora_rank": runtime_cfg.lora_rank,
+            "lora_alpha": runtime_cfg.lora_alpha,
+            "lora_a_norm": float(lora_head.lora_a.weight.detach().float().norm().cpu().item()),
+            "lora_b_norm": float(lora_head.lora_b.weight.detach().float().norm().cpu().item()),
             "optimizer_state": optimizer.state_dict(),
             "steps": runtime_cfg.max_steps,
             "backend": backend,
@@ -264,7 +295,9 @@ def run_probe_training(
         "finished_at": finished_at,
         "success": True,
         "errors": [],
-        "training_mode": "real_probe",
+        "training_mode": "lora_probe",
+        "lora_rank": runtime_cfg.lora_rank,
+        "lora_alpha": runtime_cfg.lora_alpha,
     }
 
 
@@ -294,7 +327,7 @@ def worker_entry(worker_rank: int, worker_device_id: int, args: argparse.Namespa
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "success": False,
             "errors": [str(exc), traceback.format_exc()],
-            "training_mode": "real_probe",
+            "training_mode": "lora_probe",
         }
     queue.put(payload)
 
@@ -353,7 +386,7 @@ def run_single_or_dual(args: argparse.Namespace, config: Dict[str, Any]) -> Dict
             errors.extend(payload.get("errors", []))
 
     return {
-        "mode": "real_probe",
+        "mode": "lora_probe",
         "backend": backend,
         "device_ids": device_ids,
         "workers": sorted(worker_payloads, key=lambda x: x.get("worker_rank", x["device_id"])),

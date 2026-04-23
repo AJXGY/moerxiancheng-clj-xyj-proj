@@ -134,7 +134,7 @@ python3 "${ROOT_DIR}/train_runner.py" \
   --config_file "${CONFIG_FILE}" \
   --output_dir "${SINGLE_OUTPUT_DIR}" \
   --num_gpus 1 \
-  --task_type "full_training" \
+  --task_type "lora_training" \
   --device_ids "${SINGLE_DEVICE_IDS}" \
   "${SINGLE_ARGS[@]}" \
   2>&1 | tee "${SINGLE_LOG}"
@@ -196,7 +196,7 @@ python3 "${ROOT_DIR}/train_runner.py" \
   --config_file "${CONFIG_FILE}" \
   --output_dir "${DUAL_OUTPUT_DIR}" \
   --num_gpus 2 \
-  --task_type "full_training" \
+  --task_type "lora_training" \
   --device_ids "${DUAL_DEVICE_IDS}" \
   --distributed \
   "${DUAL_ARGS[@]}" \

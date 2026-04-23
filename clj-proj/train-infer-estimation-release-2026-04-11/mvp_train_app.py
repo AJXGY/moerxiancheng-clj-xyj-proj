@@ -11,7 +11,7 @@ import torch
 from mvp_backend import default_device_string
 from mvp_calibration import build_calibration
 from mvp_train_estimator import benchmark_train_microbatch_ms, estimate_train_iteration
-from mvp_types import ExecutionConfig, RankPlacement
+from mvp_types import ExecutionConfig, HardwareCalibration, RankPlacement
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,19 +124,32 @@ def main() -> None:
     dtype_name = str(parallel_cfg.get("dtype") or model_desc.get("dtype") or "float16").lower()
     dtype = torch.bfloat16 if dtype_name in {"bf16", "bfloat16"} else torch.float16
 
-    calibration = build_calibration(dtype=dtype, device=device)
+    if request.get("skip_calibration"):
+        calibration = HardwareCalibration(
+            device_name=f"{device_backend}:profile_reuse",
+            device_index=runtime_index,
+            gemm_tflops=1.0,
+            attention_tflops=1.0,
+            memory_bandwidth_gbps=1.0,
+            launch_overhead_ms=0.0,
+        )
+    else:
+        calibration = build_calibration(dtype=dtype, device=device)
     execution = _execution_from_topology(
         hardware_topology=hardware_topology,
         device_backend=device_backend,
         physical_devices=physical_devices,
     )
-    profile_runs = 1 if model_desc.get("train_workload") == "llama_backbone_probe" else 3
-    runtime_profile = benchmark_train_microbatch_ms(
-        model_desc=model_desc,
-        parallel_cfg=parallel_cfg,
-        device_backend=device_backend,
-        runs=profile_runs,
-    )
+    runtime_profile = request.get("runtime_profile")
+    profile_source = "request_runtime_profile" if runtime_profile is not None else "online_runtime_probe"
+    if runtime_profile is None:
+        profile_runs = 1 if model_desc.get("train_workload") == "llama_backbone_probe" else 3
+        runtime_profile = benchmark_train_microbatch_ms(
+            model_desc=model_desc,
+            parallel_cfg=parallel_cfg,
+            device_backend=device_backend,
+            runs=profile_runs,
+        )
     estimate = estimate_train_iteration(
         model_desc=model_desc,
         parallel_cfg=parallel_cfg,
@@ -165,6 +178,7 @@ def main() -> None:
             "launch_overhead_ms": calibration.launch_overhead_ms,
         },
         "estimate": estimate,
+        "profile_source": profile_source,
     }
     write_report(Path(args.output_dir), report)
 

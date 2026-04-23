@@ -45,19 +45,25 @@ def build_model_description(bench):
     model_cfg = load_model_config(model_path)
     execution_dtype = "float16"
     return {
-        "name": "Meta-Llama-3.1-8B backbone training task",
-        "train_workload": "llama_backbone_probe",
+        "name": "Meta-Llama-3.1-8B LoRA feature training task",
+        "train_workload": "lora_feature_probe",
         "model_path": model_path,
         "train_samples_path": training_task.get("train_samples_path"),
         "max_seq_len": int(training_task.get("max_seq_len", 8)),
         "pipeline_split_index": int(training_task.get("pipeline_split_index", 16)),
+        "lora_rank": int(training_task.get("lora_rank", 8)),
+        "lora_alpha": float(training_task.get("lora_alpha", 16.0)),
+        "adapter_only": training_task.get("runtime_scope") == "lora_adapter_step_on_llama_hidden_features",
+        "num_labels": 2,
         "dtype": execution_dtype,
         "hidden_size": int(model_cfg["hidden_size"]),
         "stage0_out_features": int(model_cfg["intermediate_size"]),
         "stage1_out_features": int(model_cfg["hidden_size"]),
         "sequence_hidden_tokens": int(training_task.get("max_seq_len", 8)),
         "description": (
-            "Real Llama3.1-8B backbone training task with a lightweight classification head. "
+            "Real MUSA LoRA adapter-step task shaped by Llama3.1-8B hidden_size. "
+            "The full 8B backbone is not updated; low-rank LoRA adapter weights are "
+            "updated on Llama-shaped hidden features for fast training-time modeling. "
             "PP=1 runs the full backbone on one device; PP=2 splits 32 decoder layers into "
             "two stages (16+16) and transfers activations through CPU staging between devices."
         ),
@@ -70,6 +76,23 @@ def build_model_description(bench):
             "execution_dtype": execution_dtype,
         },
     }
+
+
+def scaled_profile(profile, scale, source_key):
+    payload = json.loads(json.dumps(profile))
+    payload["avg_ms"] = float(payload["avg_ms"]) * scale
+    for key in ("median_ms", "min_ms", "max_ms", "stable_cutoff_ms"):
+        if key in payload:
+            payload[key] = float(payload[key]) * scale
+    for key in ("timings_ms", "stable_timings_ms"):
+        if key in payload:
+            payload[key] = [float(value) * scale for value in payload[key]]
+    payload["source_profile_key"] = source_key
+    payload["profile_reuse_note"] = (
+        "scaled from a same-run primitive LoRA profile to avoid reloading the 8B model "
+        "for every prediction request"
+    )
+    return payload
 
 
 def build_hardware_topology(environment, cfg):
@@ -119,19 +142,42 @@ def main():
     bench = load_json(os.path.join(artifact, "benchmark_results.json"))
     configs = bench["configs"]
     environment = bench["environment"]
+    primitive_profiles = bench.get("primitive_profiles", {})
 
     evaluated = []
     for cfg in configs:
+        pp = int(cfg["pipeline_parallel_size"])
+        mb = int(cfg["microbatch_num"])
+        profile_key = "pp1_mb1" if pp == 1 else "pp2_mb1"
+        if bench.get("training_task", {}).get("runtime_scope") == "lora_adapter_step_on_llama_hidden_features":
+            runtime_profile = json.loads(json.dumps(cfg["real"]))
+            runtime_profile["source_profile_key"] = cfg["id"]
+            runtime_profile["profile_reuse_note"] = (
+                "same-configuration LoRA adapter-step profile; this avoids unstable "
+                "linear extrapolation for very short MUSA kernels"
+            )
+        elif profile_key in primitive_profiles:
+            runtime_profile = scaled_profile(
+                primitive_profiles[profile_key],
+                scale=float(mb),
+                source_key=profile_key,
+            )
+        else:
+            runtime_profile = None
         request = {
             "model": build_model_description(bench),
             "parallel_config": {
-                "pipeline_parallel_size": int(cfg["pipeline_parallel_size"]),
-                "microbatch_num": int(cfg["microbatch_num"]),
+                "pipeline_parallel_size": pp,
+                "tensor_parallel_size": int(cfg.get("tensor_parallel_size", 1)),
+                "microbatch_num": mb,
                 "global_batch_size": int(cfg["global_batch_size"]),
                 "dtype": cfg.get("dtype", "float16"),
             },
             "hardware_topology": build_hardware_topology(environment, cfg),
         }
+        if runtime_profile is not None:
+            request["runtime_profile"] = runtime_profile
+            request["skip_calibration"] = True
         predictor_dir = os.path.join(artifact, "predictor", cfg["id"])
         os.makedirs(predictor_dir, exist_ok=True)
         request_path = os.path.join(predictor_dir, "request.json")

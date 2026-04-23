@@ -11,17 +11,12 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from mvp_backend import default_device_string, is_backend_available
-from torch_infer_mvp import (
-    build_calibration,
-    collect_module_profiles,
-    dtype_from_name,
-    estimate_node,
-    extract_inference_graphs,
-    finalize_estimate_ordinals,
-    module_scope_from_stack,
-    op_family_from_target,
-    prepare_inputs,
-)
+from mvp_calibration import build_calibration
+from mvp_estimator import estimate_node, finalize_estimate_ordinals
+from mvp_execution import dtype_from_name
+from mvp_graph import module_scope_from_stack, op_family_from_target
+from mvp_profile import collect_module_profiles
+from mvp_runtime import extract_inference_graphs, prepare_inputs
 
 
 RAW_COLORS = {

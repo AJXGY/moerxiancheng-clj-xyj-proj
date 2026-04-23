@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import types
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +108,51 @@ def prepare_runtime_inputs(
     )
 
 
+
+def _unwrap_bound_forward(module: torch.nn.Module) -> Any | None:
+    bound = getattr(module, "forward", None)
+    func = getattr(bound, "__func__", None)
+    wrapped = getattr(func, "__wrapped__", None)
+    if wrapped is None:
+        return None
+    setattr(module, "forward", types.MethodType(wrapped, module))
+    return bound
+
+
+@contextmanager
+def export_compat_mode(model: torch.nn.Module):
+    try:
+        import transformers.modeling_utils as modeling_utils
+    except ImportError:
+        yield
+        return
+
+    originals: list[tuple[torch.nn.Module, Any]] = []
+    for module in (model, getattr(model, "model", None)):
+        if module is None:
+            continue
+        original = _unwrap_bound_forward(module)
+        if original is not None:
+            originals.append((module, original))
+
+    attention_map = getattr(modeling_utils.ALL_ATTENTION_FUNCTIONS, "_global_mapping", {})
+    forced_interface = attention_map.get("paged|eager") or attention_map.get("eager")
+    original_get_interface = None
+    if forced_interface is not None:
+        original_get_interface = modeling_utils.ALL_ATTENTION_FUNCTIONS.get_interface
+        modeling_utils.ALL_ATTENTION_FUNCTIONS.get_interface = (
+            lambda attn_implementation, default=None: forced_interface
+        )
+
+    try:
+        yield
+    finally:
+        if original_get_interface is not None:
+            modeling_utils.ALL_ATTENTION_FUNCTIONS.get_interface = original_get_interface
+        for module, original in originals:
+            setattr(module, "forward", original)
+
+
 def export_inference_graphs(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -118,16 +165,17 @@ def export_inference_graphs(
         *flatten_past_key_values(runtime_inputs.decode_past),
     )
 
-    prefill_export = torch.export.export(
-        PrefillWrapper(model), (input_ids, attention_mask)
-    )
-    decode_export = torch.export.export(
-        DecodeWrapper(
-            model,
-            use_dynamic_cache=hasattr(runtime_inputs.decode_past, "layers"),
-        ),
-        decode_args,
-    )
+    with export_compat_mode(model):
+        prefill_export = torch.export.export(
+            PrefillWrapper(model), (input_ids, attention_mask)
+        )
+        decode_export = torch.export.export(
+            DecodeWrapper(
+                model,
+                use_dynamic_cache=hasattr(runtime_inputs.decode_past, "layers"),
+            ),
+            decode_args,
+        )
 
     return {
         "input_ids": input_ids,

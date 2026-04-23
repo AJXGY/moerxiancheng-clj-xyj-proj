@@ -1,9 +1,9 @@
-# 5.1.6 摩尔线程架构上训练任务运行测试
+# 5.1.6 摩尔线程架构上 LoRA 训练任务运行测试
 
 这个目录提供一套完整可复现的测试工程，用于完成 `MTT-TRAIN-RUN-TEST`：
 
 - 环境预检查：识别 CPU、网络、GPU/NPU 可见性、Python 依赖
-- 训练执行：支持单卡、单机双卡、`dry-run` 冒烟验证
+- 训练执行：支持单卡、单机双卡、`dry-run` 冒烟验证，默认执行 LoRA 风格低秩适配器训练
 - 日志归档：输出结构化 JSON、JSONL、Markdown 报告
 - 结果判定：按任务 A-F 指标自动汇总完成情况
 
@@ -52,7 +52,7 @@ bash run_516_suite.sh \
 - 报告可生成
 - 单卡 / 双卡任务编排逻辑正常
 
-### 实机训练
+### 实机 LoRA 训练
 
 本任务在摩尔线程实机环境上的完整执行：
 
@@ -60,6 +60,8 @@ bash run_516_suite.sh \
 bash run_516_suite.sh \
   --model-path /home/o_mabin/moerxiancheng-clj-xyj-proj/clj-proj/model/Meta-Llama-3.1-8B
 ```
+
+默认使用 `lora_training`，冻结 8B backbone，仅更新低秩适配器参数，避免全量微调导致运行时间过长或显存压力过大。
 
 ## 预期输出
 

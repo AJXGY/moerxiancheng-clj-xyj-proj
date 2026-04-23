@@ -29,6 +29,16 @@ def main():
     environment = bench.get("environment", {})
     training_task = bench.get("training_task", {})
     model_reference = bench.get("model_reference", {})
+    unstable_configs = []
+    for cfg in bench.get("configs", []):
+        timings = [float(value) for value in cfg.get("real", {}).get("timings_ms", [])]
+        if timings and min(timings) > 0 and max(timings) / min(timings) > 10.0:
+            unstable_configs.append(cfg["id"])
+    stability_text = (
+        "存在短 kernel 采样抖动，本补充结果仅证明 TP 路径可运行，不作为稳定 20% 泛化判定。"
+        if unstable_configs
+        else "三组 TP 补充配置采样稳定，可作为补充稳定性记录。"
+    )
     output = os.path.join(ROOT, "5.2.14_TP补充任务进展.md")
 
     text = f"""# 5.2.14 TP 补充任务进展
@@ -38,7 +48,9 @@ def main():
 
 ## 当前结论
 
-本次补充实验已在双卡环境下对 `TP=2`、`MB=1/2/4` 三组配置执行真实训练时间采样，并调用主训练分析工具生成 `train_iteration_time` 预测值，用于补充展示张量并行场景下的时间建模能力。
+本次补充实验已在双卡环境下对 `TP=2`、`MB=2/4/6` 三组配置执行真实 LoRA adapter-step 训练时间采样，并调用主训练分析工具生成 `train_iteration_time` 预测值，用于补充展示张量并行场景下的时间建模能力。`MB=1/8` 在当前 MUSA 短 kernel 场景下存在启动抖动，未作为最终补充配置。
+
+稳定性说明：{stability_text}
 
 ## 关键结果
 
@@ -47,8 +59,12 @@ def main():
 - 采样类型：{environment.get('mode', 'unknown')}
 - 模型参考：Meta-Llama-3.1-8B，hidden_size={model_reference.get('hidden_size', 'unknown')}
 - 张量并行：{training_task.get('tensor_parallel_size', 'unknown')}
-- 训练参数：{training_task.get('trainable_parameters', 'unknown')}
-- 判定结果：{"通过" if model.get("all_within_20_percent") else "未通过"}
+- 训练模式：{training_task.get('training_mode', 'unknown')}
+- 采样范围：{training_task.get('runtime_scope', 'unknown')}
+- 训练参数：{training_task.get('trainable_parameters', 'unknown')}，LoRA rank={training_task.get('lora_rank', 'unknown')}
+- 误差判定：{"通过" if model.get("all_within_20_percent") else "未通过"}
+- 稳定性判定：{"需谨慎" if unstable_configs else "稳定"}
+- 抖动配置：{", ".join(unstable_configs) if unstable_configs else "无"}
 
 ## 配置结果明细
 

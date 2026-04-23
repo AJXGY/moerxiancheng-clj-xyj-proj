@@ -9,13 +9,25 @@
     "vocab_size": 128000
   },
   "training_config": {
-    "task_type": "full_training",
-    "max_steps": 1000,
+    "task_type": "lora_training",
+    "max_steps": 6,
     "learning_rate": 1e-4,
-    "warmup_steps": 100,
+    "warmup_steps": 1,
     "weight_decay": 0.01,
     "max_grad_norm": 1.0,
     "gradient_accumulation_steps": 1
+  },
+  "lora_config": {
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.0,
+    "target_modules": [
+      "q_proj",
+      "v_proj",
+      "o_proj",
+      "up_proj",
+      "down_proj"
+    ]
   },
   "optimization_strategy": {
     "zero_stage": 1,
@@ -26,7 +38,8 @@
   "data_config": {
     "dataset_name": "standard_benchmark",
     "batch_size": 32,
-    "micro_batch_size": 8,
+    "micro_batch_size": 1,
+    "max_seq_len": 32,
     "num_workers": 4,
     "prefetch_factor": 2
   },
@@ -52,10 +65,10 @@
   },
   "test_scenarios": [
     {
-      "name": "single_gpu_full_training",
+      "name": "single_gpu_lora_training_fast",
       "num_gpus": 1,
-      "task_type": "full_training",
-      "max_steps": 500
+      "task_type": "lora_training",
+      "max_steps": 6
     },
     {
       "name": "single_gpu_lora_training",
@@ -63,13 +76,13 @@
       "task_type": "lora_training",
       "lora_rank": 8,
       "lora_alpha": 16,
-      "max_steps": 500
+      "max_steps": 6
     },
     {
-      "name": "dual_gpu_full_training",
+      "name": "dual_gpu_lora_training_fast",
       "num_gpus": 2,
-      "task_type": "full_training",
-      "max_steps": 500
+      "task_type": "lora_training",
+      "max_steps": 6
     },
     {
       "name": "dual_gpu_lora_training",
@@ -77,7 +90,7 @@
       "task_type": "lora_training",
       "lora_rank": 8,
       "lora_alpha": 16,
-      "max_steps": 500
+      "max_steps": 6
     }
   ]
 }

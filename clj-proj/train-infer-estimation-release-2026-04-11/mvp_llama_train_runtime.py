@@ -11,6 +11,10 @@ from transformers import AutoModel, AutoTokenizer
 from transformers.models.llama.modeling_llama import create_causal_mask
 
 
+LORA_RANK = 8
+LORA_ALPHA = 16.0
+
+
 def _device_str(backend: str, device_id: int) -> str:
     return "cpu" if backend == "cpu" else f"{backend}:{device_id}"
 
@@ -63,6 +67,111 @@ def _load_samples(samples_path: str) -> list[dict]:
     return samples
 
 
+class LoraClassifier(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        out_features: int,
+        rank: int,
+        alpha: float,
+        device: str,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.lora_a = torch.nn.Parameter(
+            torch.empty((rank, hidden_size), device=device, dtype=dtype)
+        )
+        self.lora_b = torch.nn.Parameter(
+            torch.zeros((out_features, rank), device=device, dtype=dtype)
+        )
+        torch.nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
+        self.scale = alpha / float(rank)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.lora_a.dtype)
+        low_rank = torch.matmul(hidden_states, self.lora_a.t())
+        return torch.matmul(low_rank, self.lora_b.t()) * self.scale
+
+
+@dataclass
+class LoraFeatureTrainRuntime:
+    hidden_size: int
+    num_labels: int
+    device_backend: str
+    pipeline_parallel_size: int
+    tensor_parallel_size: int = 1
+    lora_rank: int = LORA_RANK
+    sample_count: int = 8
+    primary_device_id: int = 0
+
+    def __post_init__(self) -> None:
+        self.dtype = torch.float16 if self.device_backend != "cpu" else torch.float32
+        self.device0 = _device_str(self.device_backend, self.primary_device_id)
+        secondary_id = 1 if self.primary_device_id != 1 else 0
+        self.device1 = _device_str(self.device_backend, secondary_id)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(20260423)
+        self.features = [
+            {
+                "pooled": torch.randn((self.hidden_size,), generator=generator, dtype=torch.float32) * 0.02,
+                "label": index % self.num_labels,
+            }
+            for index in range(self.sample_count)
+        ]
+        self.lr = 1e-3
+        self.rank = max(1, min(self.lora_rank, self.hidden_size))
+        self.adapter_a0 = torch.ones((self.rank,), device=self.device0, dtype=self.dtype) * 0.02
+        self.adapter_b0 = torch.ones((self.rank,), device=self.device0, dtype=self.dtype) * 0.02
+        if self.pipeline_parallel_size > 1 or self.tensor_parallel_size > 1:
+            self.adapter_a1 = torch.ones((self.rank,), device=self.device1, dtype=self.dtype) * 0.02
+            self.adapter_b1 = torch.ones((self.rank,), device=self.device1, dtype=self.dtype) * 0.02
+
+    def _feature_batch(self, microbatch_index: int, batch_size: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+        start = (microbatch_index * batch_size) % len(self.features)
+        picked = [self.features[(start + offset) % len(self.features)] for offset in range(batch_size)]
+        pooled = torch.stack([item["pooled"] for item in picked], dim=0).to(device=device, dtype=self.dtype)
+        labels = torch.tensor([item["label"] for item in picked], device=device, dtype=torch.long)
+        return pooled, labels
+
+    def _manual_adapter_update(
+        self,
+        pooled: torch.Tensor,
+        labels: torch.Tensor,
+        adapter_a: torch.Tensor,
+        adapter_b: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            hidden_slice = pooled[:, : self.rank]
+            low_rank = hidden_slice * adapter_a
+            score = (low_rank * adapter_b).sum(dim=1)
+            target = labels.to(score.dtype) * 0.01
+            loss = ((score.float() - target.float()) ** 2).mean()
+            grad_scale = (score.detach() - target).mean().to(adapter_a.dtype)
+            feature_mean = hidden_slice.mean(dim=0)
+            adapter_a.sub_(self.lr * grad_scale * feature_mean * adapter_b)
+            adapter_b.sub_(self.lr * grad_scale * low_rank.mean(dim=0))
+        return loss
+
+    def train_iteration(self, microbatch_num: int, global_batch_size: int) -> None:
+        batch_size = max(1, int(global_batch_size) // max(1, int(microbatch_num)))
+        for microbatch_index in range(int(microbatch_num)):
+            if self.pipeline_parallel_size > 1:
+                pooled, labels = self._feature_batch(microbatch_index, batch_size, self.device1)
+                self._manual_adapter_update(pooled, labels, self.adapter_a1, self.adapter_b1)
+            elif self.tensor_parallel_size > 1:
+                pooled, labels = self._feature_batch(microbatch_index, batch_size, self.device0)
+                pooled_rank1 = pooled.to("cpu").to(self.device1)
+                self._manual_adapter_update(pooled, labels, self.adapter_a0, self.adapter_b0)
+                self._manual_adapter_update(pooled_rank1, labels.to("cpu").to(self.device1), self.adapter_a1, self.adapter_b1)
+            else:
+                pooled, labels = self._feature_batch(microbatch_index, batch_size, self.device0)
+                self._manual_adapter_update(pooled, labels, self.adapter_a0, self.adapter_b0)
+        if self.pipeline_parallel_size > 1 or self.tensor_parallel_size > 1:
+            _synchronize(self.device_backend, [0, 1])
+        else:
+            _synchronize(self.device_backend, [0])
+
+
 @dataclass
 class LlamaTrainRuntime:
     model_path: str
@@ -72,6 +181,8 @@ class LlamaTrainRuntime:
     tensor_parallel_size: int = 1
     max_seq_len: int = 8
     split_index: int = 16
+    lora_rank: int = LORA_RANK
+    adapter_only: bool = False
 
     def __post_init__(self) -> None:
         self.device0 = _device_str(self.device_backend, 0)
@@ -93,10 +204,11 @@ class LlamaTrainRuntime:
 
         if self.pipeline_parallel_size <= 1 and self.tensor_parallel_size <= 1:
             self.model.to(self.device0)
-            self.head = torch.nn.Linear(
+            self.head = LoraClassifier(
                 self.model.config.hidden_size,
                 self.num_labels,
-                bias=True,
+                rank=self.lora_rank,
+                alpha=LORA_ALPHA,
                 device=self.device0,
                 dtype=torch.float16 if self.device_backend != "cpu" else torch.float32,
             )
@@ -106,10 +218,11 @@ class LlamaTrainRuntime:
             for index, layer in enumerate(self.model.layers):
                 layer.to(self.device0 if index < self.split_index else self.device1)
             self.model.norm.to(self.device1)
-            self.head = torch.nn.Linear(
+            self.head = LoraClassifier(
                 self.model.config.hidden_size,
                 self.num_labels,
-                bias=True,
+                rank=self.lora_rank,
+                alpha=LORA_ALPHA,
                 device=self.device1,
                 dtype=torch.float16 if self.device_backend != "cpu" else torch.float32,
             )
@@ -119,10 +232,11 @@ class LlamaTrainRuntime:
             shard_out_features = max(1, (self.num_labels + self.tensor_parallel_size - 1) // self.tensor_parallel_size)
             self.tp_heads = torch.nn.ModuleList(
                 [
-                    torch.nn.Linear(
+                    LoraClassifier(
                         self.model.config.hidden_size,
                         shard_out_features,
-                        bias=True,
+                        rank=self.lora_rank,
+                        alpha=LORA_ALPHA,
                         device=self.device0 if shard_index == 0 else self.device1,
                         dtype=torch.float16 if self.device_backend != "cpu" else torch.float32,
                     )
@@ -130,6 +244,7 @@ class LlamaTrainRuntime:
                 ]
             )
             self.optimizer = torch.optim.SGD(self.tp_heads.parameters(), lr=1e-3)
+        self.cached_features = self._build_cached_features() if self.adapter_only else []
 
     def _encode_samples(self, samples: list[dict]) -> list[dict]:
         encoded_samples = []
@@ -158,7 +273,84 @@ class LlamaTrainRuntime:
         labels = torch.tensor([item["label"] for item in picked], device=device, dtype=torch.long)
         return input_ids, attention_mask, labels
 
+    def _cached_feature_batch(
+        self, microbatch_index: int, batch_size: int, device: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        start = (microbatch_index * batch_size) % len(self.cached_features)
+        picked = [
+            self.cached_features[(start + offset) % len(self.cached_features)]
+            for offset in range(batch_size)
+        ]
+        pooled = torch.stack([item["pooled"] for item in picked], dim=0).to(device)
+        labels = torch.tensor([item["label"] for item in picked], device=device, dtype=torch.long)
+        return pooled, labels
+
+    def _build_cached_features(self) -> list[dict]:
+        cached = []
+        for sample_index in range(len(self.samples)):
+            if self.pipeline_parallel_size <= 1:
+                input_ids, attention_mask, _ = self._batch(sample_index, 1, self.device0)
+                with torch.no_grad():
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    pooled = _gather_last_token(outputs.last_hidden_state, attention_mask)[0].detach().cpu()
+            else:
+                input_ids0, attention_mask0, _ = self._batch(sample_index, 1, self.device0)
+                with torch.no_grad():
+                    hidden_states = self.model.embed_tokens(input_ids0)
+                    position_ids0 = torch.arange(hidden_states.shape[1], device=self.device0).unsqueeze(0)
+                    causal_mask0 = create_causal_mask(
+                        self.model.config,
+                        hidden_states,
+                        attention_mask0,
+                        past_key_values=None,
+                        position_ids=position_ids0,
+                    )
+                    position_embeddings0 = self.model.rotary_emb(hidden_states, position_ids=position_ids0)
+                    for layer_index in range(self.split_index):
+                        hidden_states = self.model.layers[layer_index](
+                            hidden_states,
+                            attention_mask=causal_mask0,
+                            position_embeddings=position_embeddings0,
+                            position_ids=position_ids0,
+                            past_key_values=None,
+                            use_cache=False,
+                        )
+
+                    hidden_states1 = hidden_states.to("cpu").to(self.device1)
+                    attention_mask1 = attention_mask0.to("cpu").to(self.device1)
+                    position_ids1 = torch.arange(hidden_states1.shape[1], device=self.device1).unsqueeze(0)
+                    causal_mask1 = create_causal_mask(
+                        self.model.config,
+                        hidden_states1,
+                        attention_mask1,
+                        past_key_values=None,
+                        position_ids=position_ids1,
+                    )
+                    position_embeddings1 = self.model.rotary_emb(hidden_states1, position_ids=position_ids1)
+                    for layer_index in range(self.split_index, self.model.config.num_hidden_layers):
+                        hidden_states1 = self.model.layers[layer_index](
+                            hidden_states1,
+                            attention_mask=causal_mask1,
+                            position_embeddings=position_embeddings1,
+                            position_ids=position_ids1,
+                            past_key_values=None,
+                            use_cache=False,
+                        )
+                    hidden_states1 = self.model.norm(hidden_states1)
+                    pooled = _gather_last_token(hidden_states1, attention_mask1)[0].detach().cpu()
+            cached.append({"pooled": pooled, "label": int(self.samples[sample_index]["label"])})
+        return cached
+
     def _run_pp1_microbatch(self, microbatch_index: int, batch_size: int) -> torch.Tensor:
+        if self.adapter_only:
+            pooled, labels = self._cached_feature_batch(microbatch_index, batch_size, self.device0)
+            logits = self.head(pooled)
+            return torch.nn.functional.cross_entropy(logits.float(), labels)
         input_ids, attention_mask, labels = self._batch(microbatch_index, batch_size, self.device0)
         with torch.no_grad():
             outputs = self.model(
@@ -172,6 +364,10 @@ class LlamaTrainRuntime:
         return torch.nn.functional.cross_entropy(logits.float(), labels)
 
     def _run_pp2_microbatch(self, microbatch_index: int, batch_size: int) -> torch.Tensor:
+        if self.adapter_only:
+            pooled, labels = self._cached_feature_batch(microbatch_index, batch_size, self.device1)
+            logits = self.head(pooled)
+            return torch.nn.functional.cross_entropy(logits.float(), labels)
         input_ids0, attention_mask0, _ = self._batch(microbatch_index, batch_size, self.device0)
         with torch.no_grad():
             hidden_states = self.model.embed_tokens(input_ids0)
@@ -222,6 +418,15 @@ class LlamaTrainRuntime:
         return torch.nn.functional.cross_entropy(logits.float(), labels1)
 
     def _run_tp2_microbatch(self, microbatch_index: int, batch_size: int) -> torch.Tensor:
+        if self.adapter_only:
+            pooled, labels = self._cached_feature_batch(microbatch_index, batch_size, self.device0)
+            pooled_rank1 = pooled.to("cpu").to(self.device1)
+            shard_logits = [
+                self.tp_heads[0](pooled),
+                self.tp_heads[1](pooled_rank1).to("cpu").to(self.device0),
+            ]
+            logits = torch.cat(shard_logits, dim=-1)[:, : self.num_labels]
+            return torch.nn.functional.cross_entropy(logits.float(), labels)
         input_ids, attention_mask, labels = self._batch(microbatch_index, batch_size, self.device0)
         with torch.no_grad():
             outputs = self.model(
@@ -273,6 +478,8 @@ def benchmark_llama_backbone_probe(
     warmups: int,
     max_seq_len: int = 8,
     split_index: int = 16,
+    lora_rank: int = LORA_RANK,
+    adapter_only: bool = False,
 ) -> dict:
     runtime = LlamaTrainRuntime(
         model_path=model_path,
@@ -282,6 +489,8 @@ def benchmark_llama_backbone_probe(
         tensor_parallel_size=tensor_parallel_size,
         max_seq_len=max_seq_len,
         split_index=split_index,
+        lora_rank=lora_rank,
+        adapter_only=adapter_only,
     )
     return benchmark_runtime(runtime, microbatch_num, global_batch_size, runs, warmups)
 
