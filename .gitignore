@@ -29,6 +29,7 @@ latest_*_artifact.txt
 
 # Local copied/misplaced paths
 home/
+train-infer-estimation/
 
 # Local tooling / auth state
 .codex
