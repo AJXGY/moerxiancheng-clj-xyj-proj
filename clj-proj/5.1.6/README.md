@@ -7,7 +7,8 @@
 - 模型：`Meta-Llama-3.1-8B`
 - 训练方式：真实 backbone 前向 + LoRA 风格适配头参数更新
 - 单卡：`PP=1`
-- 双卡：`PP=2`，按 16/16 层切分到 `musa:0` / `musa:1`
+- 双卡流水线并行：`PP=2`，按 16/16 层切分到 `musa:0` / `musa:1`
+- 双卡张量并行补充：`TP=2`，通过共享 runtime 的 `tp_heads` 分片执行
 - 输出：运行日志、每 step 耗时、参数范数轨迹、adapter checkpoint
 
 执行：

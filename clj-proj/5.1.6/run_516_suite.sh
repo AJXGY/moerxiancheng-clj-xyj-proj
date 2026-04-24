@@ -23,7 +23,7 @@ fi
 
 STAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
 ARTIFACT_DIR="$(pwd)/artifacts/${STAMP}"
-mkdir -p "${ARTIFACT_DIR}/single" "${ARTIFACT_DIR}/dual"
+mkdir -p "${ARTIFACT_DIR}/single" "${ARTIFACT_DIR}/dual" "${ARTIFACT_DIR}/tp"
 
 /home/o_mabin/moerxiancheng-clj-xyj-proj/clj-proj/train-infer-estimation-release-2026-04-11/tools/python_with_env.sh - "${ARTIFACT_DIR}/preflight.json" <<'PY'
 import json
@@ -60,6 +60,11 @@ PY
   run_train_task.py \
   --mode dual \
   --output-dir "${ARTIFACT_DIR}/dual"
+
+/home/o_mabin/moerxiancheng-clj-xyj-proj/clj-proj/train-infer-estimation-release-2026-04-11/tools/python_with_env.sh \
+  run_train_task.py \
+  --mode tp \
+  --output-dir "${ARTIFACT_DIR}/tp"
 
 python3 summarize_results.py \
   --artifacts-dir "${ARTIFACT_DIR}" \

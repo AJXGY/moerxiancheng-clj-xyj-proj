@@ -36,15 +36,22 @@ def main():
         if is_synthetic else
         "已完成单机双卡至少 3 组组合的真实训练迭代时间实测（每组五次运行取平均），执行 Llama3.1-8B backbone 前向并更新 LoRA 风格低秩适配器参数"
     )
+    raw_items = model.get("configs", [])
+    raw_tool_passed = all(
+        abs(float(item.get("t_real_ms", 0.0)) - float(item.get("t_tool_raw_ms", item.get("t_sim_ms", 0.0))))
+        / float(item.get("t_real_ms", 1.0))
+        * 100.0
+        <= 20.0
+        for item in raw_items
+        if float(item.get("t_real_ms", 0.0)) > 0.0
+    )
     conclusion = (
-        "当前任务已通过。并行配置实测、训练时间维度预测与误差分析已完成，所有配置误差均控制在 20% 以内。"
+        "当前任务在“train-infer-estimation 主工具原始输出 + 主线专项校正”口径下通过。并行配置实测、训练时间维度预测与误差分析已完成，校正后所有配置误差均控制在 20% 以内。"
         if passed and not is_synthetic
-        else "当前任务已完成模型侧验证。并行配置采样、训练时间维度模型预测与误差分析已完成，所有配置误差均控制在 20% 以内；其中 T_real 为合成训练迭代采样。"
+        else "当前任务已完成模型侧验证。并行配置采样、训练时间维度模型预测与误差分析已完成，校正后所有配置误差均控制在 20% 以内；其中 T_real 为合成训练迭代采样。"
         if passed and is_synthetic
         else "当前任务尚未通过。并行配置实测、训练时间维度预测与误差分析已完成，但存在配置误差超过 20%，当前只能算完成了验证流程，不能算指标达标。"
     )
-    f_status = "已完成" if passed else "未通过"
-    f_desc = "所有配置误差均 ≤ 20%" if passed else "存在配置误差 > 20%，未满足验收阈值"
     postprocess = model.get("postprocess", {})
     correction_applied = bool(postprocess.get("correction_applied"))
     correction_text = (
@@ -53,6 +60,19 @@ def main():
         f"{postprocess.get('pp_weight', 0.0):.3f} * PP + {postprocess.get('intercept', 0.0):.3f}"
         if correction_applied
         else "未追加经验校正，T_sim 直接取自 train-infer-estimation 工具输出"
+    )
+    f_status = "已完成" if passed else "未通过"
+    f_desc = (
+        "校正后所有配置误差均 ≤ 20%；主工具原始输出未单独达标"
+        if passed and correction_applied and not raw_tool_passed
+        else "所有配置误差均 ≤ 20%"
+        if passed
+        else "存在配置误差 > 20%，未满足验收阈值"
+    )
+    raw_tool_text = (
+        "主工具原始输出已单独满足 ≤20% 阈值"
+        if raw_tool_passed
+        else "主工具原始输出未单独满足 ≤20% 阈值，当前达标结论依赖主线专项校正"
     )
 
     output = os.path.join(ROOT, "5.2.14任务进展.md")
@@ -73,7 +93,7 @@ def main():
 | A | 已完成 | 已完成性能建模环境与训练脚本准备 |
 | B | 已完成 | 已准备 Llama3.1-8B 训练脚本，支持 PP=1/2 和 MB=1/2 多组并行配置 |
 | C | {c_status} | {c_desc} |
-| D | 已完成 | 已调用任务响应时间分析工具输出各配置 train_iteration_time 预测值；{correction_text} |
+| D | 已完成 | 已调用任务响应时间分析工具输出各配置 train_iteration_time 原始预测值；{correction_text} |
 | E | 已完成 | 已计算并记录每组配置误差 |
 | F | {f_status} | {f_desc} |
 
@@ -87,6 +107,7 @@ def main():
 - 训练任务：mode={training_task.get('training_mode', 'unknown')}，scope={training_task.get('runtime_scope', 'unknown')}，训练参数={training_task.get('trainable_parameters', 'unknown')}，LoRA rank={training_task.get('lora_rank', 'unknown')}
 - dtype：执行 dtype=float16，请求 dtype={model_reference.get('requested_dtype', 'unknown')}
 - 预测后处理：{correction_text}
+- 原始工具判定：{raw_tool_text}
 - 判定结果：{"通过" if model['all_within_20_percent'] else "未通过"}
 
 ## 配置结果明细

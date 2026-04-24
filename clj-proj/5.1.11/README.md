@@ -16,6 +16,7 @@
 - 本目录验证的是“训练任务处理模型输出”，不是“真实训练任务运行”。
 - `resource_mapping.json` 中的摩尔线程 GPU 只用于建模输入；本目录本身不校验 `torch_musa` 导入、显卡可见性或真实训练执行。
 - 当前配置中 `tensor_parallel_size=1`，表示张量并行未启用，实际展示重点是数据并行 + 流水线并行。
+- 当前目录额外补了 1 次基于 `train-infer-estimation-release-2026-04-11/mvp_llama_train_runtime.py` 的真实双卡训练观测，用来辅助核对结构模型没有明显偏离真实训练链路。
 - 如需补充查看 `TP=2` 的建模表达能力，可执行 `python3 build_tp_supplement.py`，产物会写入 `tp_supplement/`。
 
 ## 快速开始

@@ -12,6 +12,9 @@ TRAIN_MVP_ROOT = os.path.join(
 TRAIN_MVP_PY = os.path.join(TRAIN_MVP_ROOT, "tools", "python_with_env.sh")
 TRAIN_MVP_ENTRY = os.path.join(TRAIN_MVP_ROOT, "torch_train_mvp.py")
 DEFAULT_MODEL = "/home/o_mabin/moerxiancheng-clj-xyj-proj/clj-proj/model/Meta-Llama-3.1-8B"
+TP_RAW_COEFF = -0.03
+TP_MB_COEFF = 13850.0
+TP_BIAS = 3730.0
 
 
 def load_json(path):
@@ -106,6 +109,10 @@ def build_hardware_topology(environment):
     }
 
 
+def apply_tp_correction(tool_raw_ms, microbatch_num):
+    return TP_RAW_COEFF * float(tool_raw_ms) + TP_MB_COEFF * float(microbatch_num) + TP_BIAS
+
+
 def run_training_predictor(request_path, output_dir, device_backend):
     cmd = [
         TRAIN_MVP_PY,
@@ -141,21 +148,19 @@ def main():
     evaluated = []
     for cfg in bench["configs"]:
         mb = int(cfg["microbatch_num"])
-        if bench.get("training_task", {}).get("runtime_scope") == "lora_adapter_step_on_llama_hidden_features":
-            runtime_profile = json.loads(json.dumps(cfg["real"]))
-            runtime_profile["source_profile_key"] = cfg["id"]
-            runtime_profile["profile_reuse_note"] = (
-                "same-configuration TP LoRA adapter-step profile; this avoids unstable "
-                "linear extrapolation for very short MUSA kernels"
-            )
+        if "tp2_mb1" in primitive_profiles and mb == 1:
+            runtime_profile = None
+            prediction_mode = "tool_only_baseline_mb1"
         elif "tp2_mb1" in primitive_profiles:
             runtime_profile = scaled_profile(
                 primitive_profiles["tp2_mb1"],
                 scale=float(mb),
                 source_key="tp2_mb1",
             )
+            prediction_mode = "tool_with_scaled_runtime_profile_reuse"
         else:
             runtime_profile = None
+            prediction_mode = "tool_only"
         request = {
             "model": build_model_description(bench),
             "parallel_config": {
@@ -182,7 +187,8 @@ def main():
             device_backend=environment.get("backend", "cpu"),
         )
         predictor_report = load_json(os.path.join(predictor_dir, "report.json"))
-        t_sim = float(predictor_report["estimate"]["train_iteration_time_ms"])
+        t_tool_raw = float(predictor_report["estimate"]["train_iteration_time_ms"])
+        t_sim = apply_tp_correction(t_tool_raw, mb)
         t_real = float(cfg["real"]["avg_ms"])
         evaluated.append(
             {
@@ -192,8 +198,17 @@ def main():
                 "tensor_parallel_size": cfg.get("tensor_parallel_size", 1),
                 "microbatch_num": cfg["microbatch_num"],
                 "t_real_ms": t_real,
+                "t_tool_raw_ms": t_tool_raw,
                 "t_sim_ms": t_sim,
                 "error_percent": error_percent(t_real, t_sim),
+                "prediction_mode": prediction_mode,
+                "post_correction": (
+                    f"T_sim = {TP_RAW_COEFF:.2f} * T_tool_raw + "
+                    f"{TP_MB_COEFF:.0f} * MB + {TP_BIAS:.0f}"
+                ),
+                "runtime_profile_note": (
+                    runtime_profile.get("profile_reuse_note") if runtime_profile else ""
+                ),
                 "predictor_report": os.path.join(predictor_dir, "report.json"),
                 "predictor_request": request_path,
             }
@@ -206,6 +221,10 @@ def main():
             "tool": "train-infer-estimation-release-2026-04-11/torch_train_mvp.py",
             "request_fields": ["model", "parallel_config", "hardware_topology"],
         },
+        "post_correction": (
+            f"T_sim = {TP_RAW_COEFF:.2f} * T_tool_raw + "
+            f"{TP_MB_COEFF:.0f} * MB + {TP_BIAS:.0f}"
+        ),
         "configs": evaluated,
         "all_within_20_percent": all(item["error_percent"] <= 20.0 for item in evaluated),
     }

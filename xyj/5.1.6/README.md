@@ -10,7 +10,7 @@
 ## 目录说明
 
 - `preflight_check.py` - 环境与硬件可见性检查
-- `train_runner.py` - 训练执行器，支持真实训练和 `dry-run`
+- `train_runner.py` - 训练执行器，支持真实训练、`dry-run`、双卡 `PP` / `TP`
 - `train_summarize.py` - 汇总结果并生成 Markdown 报告
 - `generate_training_charts.py` - 性能分析与可视化
 - `run_516_suite.sh` - 一键执行入口（推荐使用）
@@ -50,7 +50,7 @@ bash run_516_suite.sh \
 
 - 流程可执行
 - 报告可生成
-- 单卡 / 双卡任务编排逻辑正常
+- 单卡 / 双卡 `PP` / 双卡 `TP` 任务编排逻辑正常
 
 ### 实机 LoRA 训练
 

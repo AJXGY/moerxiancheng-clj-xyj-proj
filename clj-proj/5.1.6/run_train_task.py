@@ -54,7 +54,7 @@ def detect_backend() -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run real 5.1.6 training task with shared MVP runtime")
-    parser.add_argument("--mode", choices=["single", "dual"], required=True)
+    parser.add_argument("--mode", choices=["single", "dual", "tp"], required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model-path", default=MODEL_PATH)
     parser.add_argument("--samples-path", default=SAMPLES_PATH)
@@ -103,13 +103,63 @@ def _checkpoint_payload(runtime: LlamaTrainRuntime, mode: str) -> dict[str, Any]
     return payload
 
 
+def _memory_snapshot(backend: str, sync_ids: list[int]) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "backend": backend,
+        "per_device": [],
+    }
+    try:
+        import torch
+
+        if backend == "musa" and hasattr(torch, "musa"):
+            for device_id in sync_ids:
+                snapshot["per_device"].append(
+                    {
+                        "device_id": device_id,
+                        "allocated_bytes": int(torch.musa.memory_allocated(device_id)),
+                        "reserved_bytes": int(torch.musa.memory_reserved(device_id)),
+                        "max_allocated_bytes": int(torch.musa.max_memory_allocated(device_id)),
+                        "max_reserved_bytes": int(torch.musa.max_memory_reserved(device_id)),
+                    }
+                )
+        elif backend == "cuda":
+            for device_id in sync_ids:
+                snapshot["per_device"].append(
+                    {
+                        "device_id": device_id,
+                        "allocated_bytes": int(torch.cuda.memory_allocated(device_id)),
+                        "reserved_bytes": int(torch.cuda.memory_reserved(device_id)),
+                        "max_allocated_bytes": int(torch.cuda.max_memory_allocated(device_id)),
+                        "max_reserved_bytes": int(torch.cuda.max_memory_reserved(device_id)),
+                    }
+                )
+    except Exception as exc:
+        snapshot["collection_error"] = repr(exc)
+    return snapshot
+
+
+def _reset_peak_memory(backend: str, sync_ids: list[int]) -> None:
+    try:
+        import torch
+
+        if backend == "musa" and hasattr(torch, "musa"):
+            for device_id in sync_ids:
+                if hasattr(torch.musa, "reset_peak_memory_stats"):
+                    torch.musa.reset_peak_memory_stats(device_id)
+        elif backend == "cuda":
+            for device_id in sync_ids:
+                torch.cuda.reset_peak_memory_stats(device_id)
+    except Exception:
+        pass
+
+
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     env = detect_backend()
-    required_devices = 2 if args.mode == "dual" else 1
+    required_devices = 2 if args.mode in {"dual", "tp"} else 1
     if env["backend"] == "cpu":
         raise RuntimeError("No MUSA/CUDA accelerator available")
     if int(env["device_count"]) < required_devices:
@@ -118,35 +168,33 @@ def main() -> None:
         )
 
     pp_size = 2 if args.mode == "dual" else 1
+    tp_size = 2 if args.mode == "tp" else 1
+    sync_ids = [0, 1] if max(pp_size, tp_size) > 1 else [0]
     runtime = LlamaTrainRuntime(
         model_path=args.model_path,
         samples_path=args.samples_path,
         device_backend=env["backend"],
         pipeline_parallel_size=pp_size,
-        tensor_parallel_size=1,
+        tensor_parallel_size=tp_size,
         max_seq_len=args.max_seq_len,
         split_index=args.split_index,
         lora_rank=args.lora_rank,
         adapter_only=False,
     )
     modules = _trainable_modules(runtime)
+    _reset_peak_memory(env["backend"], sync_ids)
 
     timings_ms = []
     norm_trace = []
+    step_memory_trace = []
     for step in range(args.steps):
-        if pp_size == 1:
-            _synchronize(env["backend"], [0])
-        else:
-            _synchronize(env["backend"], [0, 1])
+        _synchronize(env["backend"], sync_ids)
         started = time.perf_counter()
         runtime.train_iteration(
             microbatch_num=args.microbatch_num,
             global_batch_size=args.global_batch_size,
         )
-        if pp_size == 1:
-            _synchronize(env["backend"], [0])
-        else:
-            _synchronize(env["backend"], [0, 1])
+        _synchronize(env["backend"], sync_ids)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         timings_ms.append(elapsed_ms)
         norm_trace.append(
@@ -154,6 +202,12 @@ def main() -> None:
                 "step": step + 1,
                 "trainable_parameter_norm": _parameter_norm(modules),
                 "elapsed_ms": elapsed_ms,
+            }
+        )
+        step_memory_trace.append(
+            {
+                "step": step + 1,
+                **_memory_snapshot(env["backend"], sync_ids),
             }
         )
 
@@ -172,6 +226,8 @@ def main() -> None:
         "device_count": env["device_count"],
         "device_names": env["device_names"],
         "pipeline_parallel_size": pp_size,
+        "tensor_parallel_size": tp_size,
+        "parallel_mode": "tp" if tp_size > 1 else "pp" if pp_size > 1 else "single",
         "microbatch_num": args.microbatch_num,
         "global_batch_size": args.global_batch_size,
         "steps": args.steps,
@@ -179,6 +235,8 @@ def main() -> None:
         "avg_step_ms": sum(timings_ms) / len(timings_ms),
         "checkpoint_path": str(checkpoint_path),
         "parameter_norm_trace": norm_trace,
+        "step_memory_trace": step_memory_trace,
+        "final_memory_snapshot": _memory_snapshot(env["backend"], sync_ids),
         "trainable_parameter_count": int(
             sum(param.numel() for module in modules for param in module.parameters())
         ),

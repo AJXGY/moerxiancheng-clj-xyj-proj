@@ -41,6 +41,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distributed", action="store_true", help="Enable distributed training")
     parser.add_argument("--dry-run", action="store_true", help="Dry run mode for smoke testing")
     parser.add_argument("--device_ids", type=str, default="", help="Comma-separated device IDs")
+    parser.add_argument(
+        "--parallel_mode",
+        type=str,
+        choices=["auto", "pp", "tp"],
+        default="auto",
+        help="Two-GPU parallel mode: pipeline parallel or tensor parallel",
+    )
     return parser.parse_args()
 
 
@@ -177,8 +184,16 @@ def main() -> int:
     global_batch_size = microbatch_num
 
     device_ids = parse_device_ids(args.device_ids, args.num_gpus)
-    mode_name = "dual" if args.num_gpus >= 2 else "single"
-    pp_size = 2 if args.num_gpus >= 2 else 1
+    if args.num_gpus >= 2:
+        selected_parallel_mode = "tp" if args.parallel_mode == "tp" else "pp"
+        mode_name = "tp" if selected_parallel_mode == "tp" else "dual"
+        pp_size = 1 if selected_parallel_mode == "tp" else 2
+        tp_size = 2 if selected_parallel_mode == "tp" else 1
+    else:
+        selected_parallel_mode = "single"
+        mode_name = "single"
+        pp_size = 1
+        tp_size = 1
 
     summary: dict[str, Any] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -196,6 +211,8 @@ def main() -> int:
         "device_names": env["device_names"],
         "device_ids": device_ids,
         "pipeline_parallel_size": pp_size,
+        "tensor_parallel_size": tp_size,
+        "parallel_mode": selected_parallel_mode,
         "microbatch_num": microbatch_num,
         "global_batch_size": global_batch_size,
         "steps": max_steps,
@@ -232,7 +249,7 @@ def main() -> int:
             samples_path=str(samples_path),
             device_backend=env["backend"],
             pipeline_parallel_size=pp_size,
-            tensor_parallel_size=1,
+            tensor_parallel_size=tp_size,
             max_seq_len=max_seq_len,
             split_index=16,
             lora_rank=lora_rank,
@@ -243,7 +260,7 @@ def main() -> int:
         parameter_norm_trace = []
 
         for step in range(max_steps):
-            sync_ids = [0, 1] if pp_size > 1 else [0]
+            sync_ids = [0, 1] if max(pp_size, tp_size) > 1 else [0]
             _synchronize(env["backend"], sync_ids)
             started = time.perf_counter()
             runtime.train_iteration(microbatch_num=microbatch_num, global_batch_size=global_batch_size)
@@ -265,7 +282,9 @@ def main() -> int:
             f"runtime_source={summary['runtime_source']}",
             f"backend={env['backend']}",
             f"mode={mode_name}",
+            f"parallel_mode={selected_parallel_mode}",
             f"pipeline_parallel_size={pp_size}",
+            f"tensor_parallel_size={tp_size}",
             f"steps={max_steps}",
             f"timings_ms={timings_ms}",
             f"checkpoint={checkpoint_path}",

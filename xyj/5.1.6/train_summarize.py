@@ -29,7 +29,7 @@ def status_line(name, status, detail):
     return f"| {name} | {status} | {detail} |"
 
 
-def classify(preflight, single, dual):
+def classify(preflight, single, dual, tp):
     """
     按照测试步骤 A-F 进行合规性分类
     返回 (step, status, detail) 元组列表
@@ -41,6 +41,7 @@ def classify(preflight, single, dual):
     
     single_ok = bool(single and single.get("success"))
     dual_ok = bool(dual and dual.get("success"))
+    tp_ok = bool(tp and tp.get("success"))
     used_dry_run = bool((single and single.get("dry_run")) or (dual and dual.get("dry_run")))
     
     single_errors = single.get("errors", []) if single else []
@@ -70,7 +71,7 @@ def classify(preflight, single, dual):
     # Step C: 训练任务启动与执行
     if single_ok and dual_ok and not used_dry_run and single_visible and dual_visible:
         c_status = "已完成"
-        c_detail = "单卡与双卡训练任务均执行成功，且均由 train-infer-estimation 训练 runtime 驱动"
+        c_detail = "单卡与双卡训练任务均执行成功，且均由 train-infer-estimation 训练 runtime 驱动；TP 补充状态：" + ("已完成" if tp_ok else "未执行")
     elif single_ok and dual_ok and used_dry_run:
         c_status = "部分完成"
         c_detail = "单卡与双卡流程已通过 dry-run 验证，待摩尔线程实机补做真实训练"
@@ -88,7 +89,7 @@ def classify(preflight, single, dual):
     
     if single_ok and dual_ok and error_free_single and error_free_dual and not used_dry_run and single_visible and dual_visible:
         d_status = "已完成"
-        d_detail = "任务日志未发现硬件识别错误、显存溢出或核心转储"
+        d_detail = "任务日志未发现硬件识别错误、显存溢出或核心转储；TP 补充日志状态：" + ("正常" if tp_ok else "未检查")
     elif single_ok and dual_ok and used_dry_run:
         d_status = "部分完成"
         d_detail = "dry-run 日志无异常，但仍需检查摩尔线程实机日志是否存在识别错误或显存问题"
@@ -108,7 +109,7 @@ def classify(preflight, single, dual):
     statuses.append((
         "E",
         "已完成" if outputs_ready and not used_dry_run else "部分完成" if (single or dual) else "未完成",
-        "已记录任务结束状态并输出真实训练结果与 checkpoint" if outputs_ready and not used_dry_run else "已生成流程验证输出，待补齐真实训练结果" if (single or dual) else "缺少训练输出"
+        "已记录任务结束状态并输出真实训练结果与 checkpoint；TP 补充状态：" + ("已生成" if tp_ok else "未生成") if outputs_ready and not used_dry_run else "已生成流程验证输出，待补齐真实训练结果" if (single or dual) else "缺少训练输出"
     ))
     
     # Step F: 测试判定
@@ -126,9 +127,9 @@ def classify(preflight, single, dual):
     return statuses
 
 
-def build_markdown(output_path, preflight, single, dual):
+def build_markdown(output_path, preflight, single, dual, tp):
     """生成Markdown报告"""
-    statuses = classify(preflight, single, dual)
+    statuses = classify(preflight, single, dual, tp)
     
     md = []
     md.append("# 5.1.6 训练任务运行测试 - 结果汇总报告\n")
@@ -202,6 +203,25 @@ def build_markdown(output_path, preflight, single, dual):
                 md.append(f"  - {error}\n")
     else:
         md.append("- 尚未执行\n")
+
+    md.append("\n## 张量并行训练结果（补充）\n\n")
+    if tp:
+        md.append(f"- **执行状态**：{'成功' if tp.get('success') else '失败'}\n")
+        md.append(f"- **Dry-run模式**：{tp.get('dry_run', False)}\n")
+        md.append(f"- **执行时间**：{tp.get('execution_time_seconds', 'N/A')}秒\n")
+        if tp.get("avg_step_ms") is not None:
+            md.append(f"- **平均每 step 时间**：{tp.get('avg_step_ms'):.3f} ms\n")
+        if tp.get("runtime_source"):
+            md.append(f"- **训练方法来源**：`{tp.get('runtime_source')}`\n")
+        if tp.get("parallel_mode"):
+            md.append(f"- **并行模式**：{tp.get('parallel_mode')}\n")
+        md.append(f"- **输出数量**：{len(tp.get('outputs', []))}\n")
+        if tp.get("errors"):
+            md.append(f"- **错误信息**：\n")
+            for error in tp.get("errors"):
+                md.append(f"  - {error}\n")
+    else:
+        md.append("- 本次未执行 TP 补充训练\n")
     
     md.append("\n## 最终判定\n\n")
     overall_status = "已完成" if all(s[1] == "已完成" for s in statuses) else "部分完成" if any(s[1] in ["已完成", "部分完成"] for s in statuses) else "未完成"
@@ -222,13 +242,15 @@ def main():
     parser.add_argument('--preflight', type=str, help='Preflight check JSON')
     parser.add_argument('--single', type=str, help='Single card result JSON')
     parser.add_argument('--dual', type=str, help='Dual card result JSON')
+    parser.add_argument('--tp', type=str, help='Tensor parallel result JSON')
     args = parser.parse_args()
     
     preflight = load_json(args.preflight) if args.preflight else None
     single = load_json(args.single) if args.single else None
     dual = load_json(args.dual) if args.dual else None
-    
-    build_markdown(args.output, preflight, single, dual)
+    tp = load_json(args.tp) if args.tp else None
+
+    build_markdown(args.output, preflight, single, dual, tp)
     return 0
 
 

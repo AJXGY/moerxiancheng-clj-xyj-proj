@@ -14,6 +14,7 @@ CONFIG_FILE="${ROOT_DIR}/train_config.json"
 DEVICE_TYPE="auto"
 SINGLE_DEVICE_IDS="0"
 DUAL_DEVICE_IDS="0,1"
+TP_DEVICE_IDS="0,1"
 DRY_RUN="false"
 EXTRA_LD_PATHS=()
 
@@ -62,6 +63,10 @@ while [[ $# -gt 0 ]]; do
       DUAL_DEVICE_IDS="$2"
       shift 2
       ;;
+    --tp-device-ids)
+      TP_DEVICE_IDS="$2"
+      shift 2
+      ;;
     --dry-run)
       DRY_RUN="true"
       shift
@@ -79,7 +84,7 @@ done
 
 STAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
 ARTIFACT_DIR="${ROOT_DIR}/artifacts/${STAMP}"
-mkdir -p "${ARTIFACT_DIR}/preflight" "${ARTIFACT_DIR}/single" "${ARTIFACT_DIR}/dual"
+mkdir -p "${ARTIFACT_DIR}/preflight" "${ARTIFACT_DIR}/single" "${ARTIFACT_DIR}/dual" "${ARTIFACT_DIR}/tp"
 
 echo "=========================================="
 echo "5.1.6 训练任务运行测试 (MTT-TRAIN-RUN-TEST)"
@@ -258,6 +263,78 @@ echo "✓ 双卡训练完成，结果：${DUAL_OUTPUT_DIR}"
 echo ""
 
 # ============================================================================
+# Step C-E: 双卡张量并行训练
+# ============================================================================
+
+echo "[执行] 步骤C-E: 双卡张量并行训练任务..."
+TP_ARGS=()
+TP_OUTPUT_DIR="${ARTIFACT_DIR}/tp"
+
+if [[ "${DRY_RUN}" == "true" ]]; then
+  TP_ARGS+=(--dry-run)
+  echo "  (干运行模式)"
+fi
+
+TP_LOG="${TP_OUTPUT_DIR}/training.log"
+TP_START_TIME=$(date +%s)
+
+set +e
+python3 "${ROOT_DIR}/train_runner.py" \
+  --model_path "${MODEL_PATH}" \
+  --config_file "${CONFIG_FILE}" \
+  --output_dir "${TP_OUTPUT_DIR}" \
+  --num_gpus 2 \
+  --task_type "lora_training" \
+  --device_ids "${TP_DEVICE_IDS}" \
+  --parallel_mode tp \
+  --distributed \
+  "${TP_ARGS[@]}" \
+  2>&1 | tee "${TP_LOG}"
+TP_RC=${PIPESTATUS[0]}
+set -e
+
+TP_END_TIME=$(date +%s)
+TP_DURATION=$((TP_END_TIME - TP_START_TIME))
+
+if [[ -f "${TP_OUTPUT_DIR}/summary.json" ]]; then
+  python3 - "${TP_OUTPUT_DIR}/summary.json" "${TP_DURATION}" <<'PY'
+import json, sys
+path = sys.argv[1]
+duration = int(sys.argv[2])
+with open(path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+payload["execution_time_seconds"] = duration
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, ensure_ascii=False, indent=2)
+PY
+else
+  if [[ ${TP_RC} -eq 0 ]]; then
+    TP_SUCCESS=true
+    TP_ERRORS='[]'
+  else
+    TP_SUCCESS=false
+    TP_ERRORS='["train_runner_exit_code:'"${TP_RC}"'"]'
+  fi
+  cat > "${TP_OUTPUT_DIR}/summary.json" <<EOF
+{
+  "test_id": "MTT-TRAIN-RUN-TEST-TP",
+  "model_path": "${MODEL_PATH}",
+  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "dry_run": ${DRY_RUN},
+  "num_gpus": 2,
+  "parallel_mode": "tp",
+  "success": ${TP_SUCCESS},
+  "execution_time_seconds": ${TP_DURATION},
+  "outputs": ["${TP_LOG}"],
+  "errors": ${TP_ERRORS}
+}
+EOF
+fi
+
+echo "✓ 张量并行训练完成，结果：${TP_OUTPUT_DIR}"
+echo ""
+
+# ============================================================================
 # Step F: 结果汇总与判定
 # ============================================================================
 
@@ -268,7 +345,8 @@ python3 "${ROOT_DIR}/train_summarize.py" \
   --output "${SUMMARY_OUTPUT}" \
   --preflight "${PREFLIGHT_OUTPUT}" \
   --single "${SINGLE_OUTPUT_DIR}/summary.json" \
-  --dual "${DUAL_OUTPUT_DIR}/summary.json"
+  --dual "${DUAL_OUTPUT_DIR}/summary.json" \
+  --tp "${TP_OUTPUT_DIR}/summary.json"
 
 echo "✓ 结果汇总完成，报告：${SUMMARY_OUTPUT}"
 echo ""
@@ -287,6 +365,7 @@ echo "生成的输出文件："
 echo "  - 前置检查：${PREFLIGHT_OUTPUT}"
 echo "  - 单卡训练：${SINGLE_OUTPUT_DIR}/"
 echo "  - 双卡训练：${DUAL_OUTPUT_DIR}/"
+echo "  - TP训练：${TP_OUTPUT_DIR}/"
 echo "  - 完成总结：${SUMMARY_OUTPUT}"
 echo "=========================================="
 echo ""
@@ -294,12 +373,12 @@ OVERALL_RC=0
 if [[ ${PREFLIGHT_RC} -ne 0 ]]; then
   OVERALL_RC=1
 fi
-if [[ ${SINGLE_RC} -ne 0 || ${DUAL_RC} -ne 0 ]]; then
+if [[ ${SINGLE_RC} -ne 0 || ${DUAL_RC} -ne 0 || ${TP_RC} -ne 0 ]]; then
   OVERALL_RC=1
 fi
 
 if [[ ${OVERALL_RC} -ne 0 ]]; then
-  echo "[警告] 测试存在失败项：preflight=${PREFLIGHT_RC}, single=${SINGLE_RC}, dual=${DUAL_RC}" >&2
+  echo "[警告] 测试存在失败项：preflight=${PREFLIGHT_RC}, single=${SINGLE_RC}, dual=${DUAL_RC}, tp=${TP_RC}" >&2
 fi
 
 exit ${OVERALL_RC}

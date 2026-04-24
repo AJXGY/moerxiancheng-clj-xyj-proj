@@ -16,7 +16,7 @@ import sys
 if TOOL_ROOT not in sys.path:
     sys.path.insert(0, TOOL_ROOT)
 
-from mvp_llama_train_runtime import LoraFeatureTrainRuntime, benchmark_runtime
+from mvp_llama_train_runtime import LlamaTrainRuntime, benchmark_runtime
 
 
 def utc_stamp():
@@ -47,7 +47,7 @@ def detect_backend():
                 "backend": "musa",
                 "device_count": count,
                 "device_names": [torch.musa.get_device_name(i) for i in range(count)],
-                "mode": "real_lora_feature_training_task_tp",
+                "mode": "real_llama_training_task_tp",
                 "topology": "pcie" if count >= 2 else "local",
             }
     except Exception:
@@ -62,7 +62,7 @@ def detect_backend():
                 "backend": "cuda",
                 "device_count": count,
                 "device_names": [torch.cuda.get_device_name(i) for i in range(count)],
-                "mode": "real_lora_feature_training_task_tp",
+                "mode": "real_llama_training_task_tp",
                 "topology": "pcie" if count >= 2 else "local",
             }
     except Exception:
@@ -121,27 +121,31 @@ def main():
         "requested_dtype": str(model_cfg.get("torch_dtype") or "float16"),
     }
     training_task = {
-        "task_kind": "llama_lora_feature_probe_training_tp_supplement",
+        "task_kind": "llama_backbone_probe_training_tp_supplement",
         "train_samples_path": TRAIN_SAMPLES,
         "max_seq_len": 8,
         "tensor_parallel_size": 2,
+        "pipeline_split_index": 16,
         "optimizer": "sgd",
-        "training_mode": "lora",
         "lora_rank": 8,
         "lora_alpha": 16.0,
-        "trainable_parameters": "tp_sharded_lora_adapter",
-        "runtime_scope": "lora_adapter_step_on_llama_hidden_features",
-        "backbone_update": "frozen_backbone_represented_by_config_shape",
+        "training_mode": "lora",
+        "trainable_parameters": "tp_sharded_classification_head",
+        "runtime_scope": "llama_backbone_forward_with_tp_sharded_head_update",
+        "backbone_update": "frozen_backbone_real_forward",
     }
 
-    if env["mode"] == "real_lora_feature_training_task_tp":
-        runtime = LoraFeatureTrainRuntime(
-            hidden_size=int(model_cfg["hidden_size"]),
-            num_labels=2,
+    if env["mode"] == "real_llama_training_task_tp":
+        runtime = LlamaTrainRuntime(
+            model_path=args.model_path,
+            samples_path=TRAIN_SAMPLES,
             device_backend=env["backend"],
             pipeline_parallel_size=1,
             tensor_parallel_size=2,
-            lora_rank=training_task["lora_rank"],
+            max_seq_len=int(training_task["max_seq_len"]),
+            split_index=int(training_task["pipeline_split_index"]),
+            lora_rank=int(training_task["lora_rank"]),
+            adapter_only=False,
         )
         primitive_profiles = {
             "tp2_mb1": benchmark_runtime(
@@ -153,13 +157,16 @@ def main():
             )
         }
         for cfg in configs:
-            real = benchmark_runtime(
-                runtime,
-                microbatch_num=int(cfg["microbatch_num"]),
-                global_batch_size=int(cfg["global_batch_size"]),
-                runs=args.runs_per_config,
-                warmups=2,
-            )
+            if int(cfg["microbatch_num"]) == 1 and int(cfg["global_batch_size"]) == 1:
+                real = json.loads(json.dumps(primitive_profiles["tp2_mb1"]))
+            else:
+                real = benchmark_runtime(
+                    runtime,
+                    microbatch_num=int(cfg["microbatch_num"]),
+                    global_batch_size=int(cfg["global_batch_size"]),
+                    runs=args.runs_per_config,
+                    warmups=2,
+                )
             results.append({**cfg, "real": real})
     else:
         primitive_profiles = {"tp2_mb1": synthetic_runs({"microbatch_num": 1}, args.runs_per_config)}

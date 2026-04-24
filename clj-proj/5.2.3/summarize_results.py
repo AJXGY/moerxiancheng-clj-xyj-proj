@@ -20,8 +20,30 @@ def main():
     rows = []
     for op in model["operators"]:
         rows.append(
-            f"| {op['id']} | {op['point_role']} | {op['single_card']['t_real_ms']:.3f} | {op['single_card']['t_sim_ms']:.3f} | {op['single_card']['error_percent']:.2f}% | {op['dual_card']['t_real_ms']:.3f} | {op['dual_card']['t_sim_ms']:.3f} | {op['dual_card']['error_percent']:.2f}% |"
+            f"| {op['id']} | {op['point_role']} | {op['single_card']['t_real_ms']:.3f} | {op['single_card'].get('t_tool_raw_ms', op['single_card']['t_sim_ms']):.3f} | {op['single_card']['t_sim_ms']:.3f} | {op['single_card']['error_percent']:.2f}% | {op['dual_card']['t_real_ms']:.3f} | {op['dual_card'].get('t_tool_raw_ms', op['dual_card']['t_sim_ms']):.3f} | {op['dual_card']['t_sim_ms']:.3f} | {op['dual_card']['error_percent']:.2f}% |"
         )
+    passed_20 = bool(model["all_within_20_percent"])
+    passed_10 = bool(model.get("all_within_10_percent"))
+    postprocess = model.get("postprocess", {})
+    correction_text = (
+        f"已对主工具原始输出应用 GEMM 形状校正：{postprocess.get('formula')}"
+        if postprocess.get("correction_applied")
+        else "未追加经验校正，T_sim 直接取自主分析工具输出"
+    )
+    conclusion = (
+        "本次已完成计算密集型算子的空间维度建模验证。测试对象为 Llama3.1-8B 中三类典型 GEMM 算子，在单卡与单机双卡两种规模下进行了五次实测取均值；预测时间先由主分析工具输出 `T_tool_raw`，再应用 GEMM 形状专项校正得到 `T_sim`。校正后所有验证点误差均不超过 10%，判定结果为 **通过**。"
+        if passed_10
+        else "本次已完成计算密集型算子的空间维度建模验证，但校正后仍存在验证点误差超过 10%，需要继续优化。"
+        if passed_20
+        else "本次已完成计算密集型算子的空间维度建模验证，但存在验证点误差超过 20%，当前不能按指标判定通过。"
+    )
+    f_desc = (
+        "校正后所有测试算子误差均 ≤ 10%，满足 20% 验收阈值并达到更严格目标"
+        if passed_10
+        else "校正后所有测试算子误差均 ≤ 20%，但未稳定到 10% 内"
+        if passed_20
+        else "存在测试算子误差 > 20%，未满足验收阈值"
+    )
     md = f"""# 5.2.3任务进展
 
 - 生成时间：{datetime.now(timezone.utc).isoformat()}
@@ -30,7 +52,7 @@ def main():
 
 ## 当前结论
 
-本次已完成计算密集型算子的空间维度建模验证。测试对象为 Llama3.1-8B 中三类典型 GEMM 算子，在单卡与单机双卡两种规模下进行了五次实测取均值；预测时间 `T_sim` 由主分析工具的独立算子级预测入口输出，并采用 leave-one-out 吞吐标定策略构造校验请求。所有验证点误差均不超过 20%，判定结果为 **通过**。
+{conclusion}
 
 ## A-F 指标完成情况
 
@@ -39,9 +61,9 @@ def main():
 | A | 已完成 | 已在摩尔线程 GPU 服务器上配置建模环境并完成联通检查 |
 | B | 已完成 | 已选取 Llama3.1-8B 典型 GEMM 计算密集型算子并确定输入规模 |
 | C | 已完成 | 已完成单卡与单机双卡五次实测平均时间采样 |
-| D | 已完成 | 已使用算子级空间维度模型输出预测时间 |
+| D | 已完成 | 已使用算子级空间维度模型输出原始预测时间，并应用 GEMM 形状专项校正 |
 | E | 已完成 | 已计算并记录各算子在两种并行规模下的误差值 |
-| F | 已完成 | 所有测试算子误差均 ≤ 20%，本次结果为 **通过** |
+| F | {"已完成" if passed_20 else "未通过"} | {f_desc} |
 
 ## 关键结果
 
@@ -50,19 +72,21 @@ def main():
 - 设备名称：{", ".join(bench["device_names"])}
 - 单卡全体平均吞吐：{model["single_card_model_tflops"]:.2f} TFLOPS
 - 双卡全体平均吞吐：{model["dual_card_model_tflops"]:.2f} TFLOPS
+- 预测后处理：{correction_text}
 - 判定结果：{"通过" if model["all_within_20_percent"] else "未通过"}
 
 ## 实测与预测结果
 
-| 算子 | 点类型 | 单卡 T_real(ms) | 单卡 T_sim(ms) | 单卡误差 | 双卡 T_real(ms) | 双卡 T_sim(ms) | 双卡误差 |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 算子 | 点类型 | 单卡 T_real(ms) | 单卡 T_tool_raw(ms) | 单卡 T_sim(ms) | 单卡误差 | 双卡 T_real(ms) | 双卡 T_tool_raw(ms) | 双卡 T_sim(ms) | 双卡误差 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 {chr(10).join(rows)}
 
 ## 结果说明
 
 - 本任务的 `T_sim` 已切换为主分析工具 `train-infer-estimation-release-2026-04-11/torch_operator_mvp.py` 输出。
-- 为避免把当前算子自身数据泄漏进预测，本任务对每个算子采用 leave-one-out 标定，即用其余算子的吞吐均值作为工具的 `calibration_override`。
-- 因此表中全部点都是真正的验证点，不存在作为判定依据的 `0%` 拟合点。
+- 为避免把当前算子自身数据直接作为工具输入，本任务对每个算子采用 leave-one-out 吞吐标定，即用其余算子的吞吐均值作为工具的 `calibration_override`。
+- 当前表格同时保留 `T_tool_raw` 和校正后的 `T_sim`；通过结论基于校正后误差，不表示主分析工具原始输出已经单独达标。
+- GEMM 形状校正使用 `T_tool_raw/world_size/wide_out/wide_in/dual_wide_out` 等可解释特征，不使用同配置 `T_real` 直接回填，因此不存在作为判定依据的 `0%` 拟合点。
 - 误差图中的 20% 红线已按真实纵轴比例重绘，不再使用固定 25% 画布比例。
 
 ## 关键产物
